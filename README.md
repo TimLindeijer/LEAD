@@ -141,7 +141,7 @@ The meaning and explanation of each parameter in command line can be found in `r
 
 
 ## Train from Scratch
-Since three of the datasets are private, it is not feasible to train the model from scratch using all the datasets. 
+Since three of the datasets are private, it is not feasible to train our model from scratch using all the datasets. 
 However, you can still train the model partially by utilizing the public datasets. 
 Here are some examples for supervised learning, self-supervised pre-training, and fine-tuning:
 
@@ -197,25 +197,52 @@ python -u run.py --method LEAD --task_name finetune --is_training 0 --root_path 
 ```
 
 
-## Fine-tune the Pre-trained Model on Custom Dataset
+# Apply Our Pre-trained Model on Your Own Dataset
+We provide a guideline to apply our pre-trained model on your own custom dataset step by step.
 
-Suppose the new custom EEG-Based AD detection dataset is named `CUSTOM`, and was preprocessed with the same pipeline as our method and saved in `dataset/CUSTOM/`.
-You can write a customized class `CUSTOMLoader` in  `data_provider/dataset_loader/custom_loader.py` to load the data.
-Then the dataset named `CUSTOM` should be added in `data_provider/data_loader.py` in `data_folder_dict` like `'CUSTOM': CUSTOMLoader`,
+### 1. Preprocess Your Custom EEG-Based AD Detection Dataset
+Suppose your new custom EEG-Based AD detection dataset is named `CUSTOM`. 
+You can preprocess the dataset by following the same pipeline as our method described in the Data Preprocessing section.
+Take the files in `data_preprocessing/` as a reference to design your new preprocessing file.
+The first four preprocessing steps includes artifact removal, channel alignment, frequency alignment, sample segmentation should be applied to the new custom dataset in this step.
+The processed data is a 19-channel EEG dataset with 1-second samples at 128Hz.
+The channel order should be Fp1, Fp2, F7, F3, Fz, F4, F8, T3/T7, C3, Cz, C4, T4/T8, T5/P7, P3, Pz, P4, T6/P8, O1, and O2.
+The processed dataset `CUSTOM` should have two folders: `Feature/` and `Label/`. 
+The folder `Feature/` contains files named in the format `feature_ID.npy`, each ID corresponding to a subject. 
+Each`feature_ID.npy` file contains samples belonging to the same subject and stacked into a 3-D array with shape [N-sample, 128, 19], 
+where N-sample denotes the number of samples in this subject, 128 denotes the timestamps for a sample, and 19 denotes the number of channels.
+The processed data should be put into `dataset/CUSTOM/` so that each subject file can be located by `dataset/CUSTOM/Feature/feature_ID.npy`, 
+and the label file can be located by `dataset/CUSTOM/Label/label.npy`.
+
+### 2. Load Your Custom EEG-Based AD Detection Dataset
+Create a new file named `custom_loader.py` in the `data_provider/dataset_loader/` folder to load the new custom dataset.
+Write a customized class `CUSTOMLoader` in  `data_provider/dataset_loader/custom_loader.py` to load the data.
+Take the files in `data_provider/dataset_loader/` as a reference to design your new loader file. 
+The goal is to perform subject-independent evaluation on the new custom dataset.
+Based on your requirements, you can split the subjects in a fixed ratio, Monte Carlo cross-validation, or leave-one-subject-out cross-validation.
+The rest of two preprocessing steps including frequency filtering and standard normalization should be applied to the new custom dataset in this step.
+Import the `CUSTOMLoader` class in `data_provider/data_loader.py` and add the dataset named `CUSTOM` in `data_folder_dict` like `'CUSTOM': CUSTOMLoader`.
 Now you are able to load the new dataset by passing its name in the `run.py`.
 Depending on the training task, the new dataset can be added in `--pretraining_datasets`, `--training_datasets`, or `--testing_datasets` in the command line.
+If you simply want to finetune our pre-trained model on the new custom dataset, you can add the new dataset in `--training_datasets` and `--testing_datasets`.
 
+### 3. Download Our Pre-trained Model
 The pretrained model can be downloaded from the following link:
 https://drive.google.com/drive/folders/1JDg0VxbML6pIrzxzm9GXiC6ixUIgujt9?usp=sharing.
 Place the downloaded checkpoints folder `LEAD` under folder `checkpoints/`.
-We provided four choices to utilized our pre-trained model on the new custom dataset.
-For choices a), b), and d), there is no specific requirements for the number of classes in the new custom dataset.
-You can modify the projection head in the code to adapt to the number of classes in the new custom dataset.
-It is even possible to use the pre-trained model for tasks beyond EEG-based AD detection since the model has learned other neurological diseases, 
-such as Parkinson's disease, depression, and epilepsy.
-For choice c), the new custom dataset should be a binary classification dataset between AD patients and healthy subjects to enable unified fine-tuning on multiple datasets together.
+The folder path is organized as `./checkpoints/method/task_name/model/model_id/`,
+where the description of `--method`, `--task_name`, `--model`, and `--model_id` can be found in the `run.py` file.
 
-a) Finetune the LEAD-Sup model in our paper (Named S-5-Sup in the code) on the new custom dataset:
+
+### 4. Finetune Our Pre-trained Model on Your Custom Dataset
+We provided four choices to utilized our pre-trained model on the new custom dataset.
+For choices **a)**, **b)**, and **c)**, there is no specific requirements for the number of classes in the new custom dataset.
+You can modify the projection head in the code to adapt to any number of classes in your new custom dataset.
+It is even possible to use our pre-trained model for tasks beyond EEG-based AD detection since the model has learned features of other neurological diseases, 
+such as Parkinson's Disease, Depression, and Epilepsy.
+For choice **d)**, the new custom dataset should be a binary classification dataset between AD patients and healthy subjects to enable unified fine-tuning on multiple datasets together.
+
+#### a) Finetune the LEAD-Sup model in our paper (Named S-5-Sup in the code) on the new custom dataset:
 ```bash
 python -u run.py --method LEAD --checkpoints_path ./checkpoints/LEAD/supervised/LEAD/S-5-Sup/ --task_name finetune --is_training 1 --root_path ./dataset/ --model_id S-5-F-CUSTOM-Base --model LEAD --data MultiDatasets \
 --training_datasets CUSTOM \
@@ -224,7 +251,7 @@ python -u run.py --method LEAD --checkpoints_path ./checkpoints/LEAD/supervised/
 --des 'Exp' --itr 5 --learning_rate 0.0001 --train_epochs 100 --patience 15
 ```
 
-b) Finetune the LEAD-Base model in our paper (Named P-11-F-5-Base in the code) on the new custom dataset:
+#### b) Finetune the LEAD-Base model in our paper (Named P-11-F-5-Base in the code) on the new custom dataset:
 ```bash
 python -u run.py --method LEAD --checkpoints_path ./checkpoints/LEAD/finetune/LEAD/P-11-F-5-Base/ --task_name finetune --is_training 1 --root_path ./dataset/ --model_id P-11-F-5-F-CUSTOM-Base --model LEAD --data MultiDatasets \
 --training_datasets CUSTOM \
@@ -233,7 +260,22 @@ python -u run.py --method LEAD --checkpoints_path ./checkpoints/LEAD/finetune/LE
 --des 'Exp' --itr 5 --learning_rate 0.0001 --train_epochs 100 --patience 15
 ```
 
-c) Unified finetune the P-14-Base(pre-trained on 11 pre-training and 3 private AD datasets) model with two public AD datasets on the new custom dataset:
+#### c) Finetune the LEAD-All model in our paper (Named P-16-Base in the code) on the new custom dataset:
+```bash
+python -u run.py --method LEAD --checkpoints_path ./checkpoints/LEAD/pretrain_lead/LEAD/P-16-Base/ --task_name finetune --is_training 1 --root_path ./dataset/ --model_id P-16-F-CUSTOM-Base --model LEAD --data MultiDatasets \
+--training_datasets CUSTOM \
+--testing_datasets CUSTOM \
+--e_layers 12 --batch_size 128 --n_heads 8 --d_model 128 --d_ff 256 --swa \
+--des 'Exp' --itr 5 --learning_rate 0.0001 --train_epochs 100 --patience 15
+```
+Note that the LEAD-All model utilizes all our 16 datasets for pre-training, 
+so there is no separate downstream dataset to evaluate its performance. 
+Consequently, its performance is not guaranteed to be superior to the LEAD-Sup and LEAD-Base model. 
+Theoretically, the LEAD-All model should have learned more general EEG features and AD-specific features.
+Note that your custom dataset should have no overlap with the 16 datasets used for pre-training the LEAD-All model to ensure no data leakage.
+
+
+#### d) Unified finetune your custom dataset with two public AD datasets on the P-14-Base model in our paper(pre-trained on 11 pre-training and 3 private AD datasets):
 ```bash
 python -u run.py --method LEAD --checkpoints_path ./checkpoints/LEAD/pretrain_lead/LEAD/P-14-Base/ --task_name finetune --is_training 1 --root_path ./dataset/ --model_id P-14-F-3-Base --model LEAD --data MultiDatasets \
 --training_datasets ADFTD,BrainLat-19,CUSTOM \
@@ -248,21 +290,6 @@ python -u run.py --method LEAD --task_name finetune --is_training 0 --root_path 
 --e_layers 12 --batch_size 128 --n_heads 8 --d_model 128 --d_ff 256 --swa \
 --des 'Exp' --itr 5 --learning_rate 0.0001 --train_epochs 100 --patience 15
 ```
-
-d) Finetune the LEAD-All model in our paper (Named P-16-Base in the code) on the new custom dataset:
-```bash
-python -u run.py --method LEAD --checkpoints_path ./checkpoints/LEAD/pretrain_lead/LEAD/P-16-Base/ --task_name finetune --is_training 1 --root_path ./dataset/ --model_id P-16-F-CUSTOM-Base --model LEAD --data MultiDatasets \
---training_datasets CUSTOM \
---testing_datasets CUSTOM \
---e_layers 12 --batch_size 128 --n_heads 8 --d_model 128 --d_ff 256 --swa \
---des 'Exp' --itr 5 --learning_rate 0.0001 --train_epochs 100 --patience 15
-```
-Note that the LEAD-All model utilizes all 16 datasets for pre-training, 
-so there is no separate downstream dataset to evaluate its performance. 
-Consequently, its performance is not guaranteed to be superior to the LEAD-Sup and LEAD-Base model. 
-Additionally, none of the 16 datasets used for pre-training should be used for fine-tuning or testing, 
-as the model has already seen these datasets during the pre-training stage and may cause data leakage.
-
 
 
 ## Acknowledgement
