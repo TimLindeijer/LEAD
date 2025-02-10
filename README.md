@@ -232,19 +232,32 @@ https://drive.google.com/drive/folders/1JDg0VxbML6pIrzxzm9GXiC6ixUIgujt9?usp=sha
 Place the downloaded checkpoints folder `LEAD` under folder `checkpoints/`.
 The folder path is organized as `./checkpoints/method/task_name/model/model_id/`,
 where the description of `--method`, `--task_name`, `--model`, and `--model_id` can be found in the `run.py` file.
+For here, the `--method` and `--model` should be `LEAD`, 
+the `--task_name` should be `pretrain_lead`, `supervised`, or `finetune`, 
+and the `--model_id` should be the model name you want to use.
 
 
-### 4. Finetune Our Pre-trained Model on Your Custom Dataset
+### 4. Finetune Our Pre-trained Model on Your Custom Dataset and Test the Performance
 We provided four choices to utilized our pre-trained model on the new custom dataset.
 For choices **a)**, **b)**, and **c)**, there is no specific requirements for the number of classes in the new custom dataset.
 You can modify the projection head in the code to adapt to any number of classes in your new custom dataset.
 It is even possible to use our pre-trained model for tasks beyond EEG-based AD detection since the model has learned features of other neurological diseases, 
 such as Parkinson's Disease, Depression, and Epilepsy.
 For choice **d)**, the new custom dataset should be a binary classification dataset between AD patients and healthy subjects to enable unified fine-tuning on multiple datasets together.
+The sample and subject-level performance can be found in the `results/LEAD/finetune/LEAD/model_id/` folder,
+where `--model_id` is the model name you used in the command line.
 
 #### a) Finetune the LEAD-Sup model in our paper (Named S-5-Sup in the code) on the new custom dataset:
 ```bash
+# fine-tuning
 python -u run.py --method LEAD --checkpoints_path ./checkpoints/LEAD/supervised/LEAD/S-5-Sup/ --task_name finetune --is_training 1 --root_path ./dataset/ --model_id S-5-F-CUSTOM-Base --model LEAD --data MultiDatasets \
+--training_datasets CUSTOM \
+--testing_datasets CUSTOM \
+--e_layers 12 --batch_size 128 --n_heads 8 --d_model 128 --d_ff 256 --swa \
+--des 'Exp' --itr 5 --learning_rate 0.0001 --train_epochs 100 --patience 15
+
+# test
+python -u run.py --method LEAD --task_name finetune --is_training 0 --root_path ./dataset/ --model_id S-5-F-CUSTOM-Base --model LEAD --data MultiDatasets \
 --training_datasets CUSTOM \
 --testing_datasets CUSTOM \
 --e_layers 12 --batch_size 128 --n_heads 8 --d_model 128 --d_ff 256 --swa \
@@ -253,7 +266,15 @@ python -u run.py --method LEAD --checkpoints_path ./checkpoints/LEAD/supervised/
 
 #### b) Finetune the LEAD-Base model in our paper (Named P-11-F-5-Base in the code) on the new custom dataset:
 ```bash
+# fine-tuning
 python -u run.py --method LEAD --checkpoints_path ./checkpoints/LEAD/finetune/LEAD/P-11-F-5-Base/ --task_name finetune --is_training 1 --root_path ./dataset/ --model_id P-11-F-5-F-CUSTOM-Base --model LEAD --data MultiDatasets \
+--training_datasets CUSTOM \
+--testing_datasets CUSTOM \
+--e_layers 12 --batch_size 128 --n_heads 8 --d_model 128 --d_ff 256 --swa \
+--des 'Exp' --itr 5 --learning_rate 0.0001 --train_epochs 100 --patience 15
+
+# test
+python -u run.py --method LEAD --task_name finetune --is_training 0 --root_path ./dataset/ --model_id P-11-F-5-F-CUSTOM-Base --model LEAD --data MultiDatasets \
 --training_datasets CUSTOM \
 --testing_datasets CUSTOM \
 --e_layers 12 --batch_size 128 --n_heads 8 --d_model 128 --d_ff 256 --swa \
@@ -262,7 +283,15 @@ python -u run.py --method LEAD --checkpoints_path ./checkpoints/LEAD/finetune/LE
 
 #### c) Finetune the LEAD-All model in our paper (Named P-16-Base in the code) on the new custom dataset:
 ```bash
+# fine-tuning
 python -u run.py --method LEAD --checkpoints_path ./checkpoints/LEAD/pretrain_lead/LEAD/P-16-Base/ --task_name finetune --is_training 1 --root_path ./dataset/ --model_id P-16-F-CUSTOM-Base --model LEAD --data MultiDatasets \
+--training_datasets CUSTOM \
+--testing_datasets CUSTOM \
+--e_layers 12 --batch_size 128 --n_heads 8 --d_model 128 --d_ff 256 --swa \
+--des 'Exp' --itr 5 --learning_rate 0.0001 --train_epochs 100 --patience 15
+
+# test
+python -u run.py --method LEAD --task_name finetune --is_training 0 --root_path ./dataset/ --model_id P-16-F-CUSTOM-Base --model LEAD --data MultiDatasets \
 --training_datasets CUSTOM \
 --testing_datasets CUSTOM \
 --e_layers 12 --batch_size 128 --n_heads 8 --d_model 128 --d_ff 256 --swa \
@@ -277,14 +306,14 @@ Note that your custom dataset should have no overlap with the 16 datasets used f
 
 #### d) Unified finetune your custom dataset with two public AD datasets on the P-14-Base model in our paper(pre-trained on 11 pre-training and 3 private AD datasets):
 ```bash
+# fine-tuning
 python -u run.py --method LEAD --checkpoints_path ./checkpoints/LEAD/pretrain_lead/LEAD/P-14-Base/ --task_name finetune --is_training 1 --root_path ./dataset/ --model_id P-14-F-3-Base --model LEAD --data MultiDatasets \
 --training_datasets ADFTD,BrainLat-19,CUSTOM \
 --testing_datasets ADFTD,BrainLat-19,CUSTOM \
 --e_layers 12 --batch_size 128 --n_heads 8 --d_model 128 --d_ff 256 --swa \
 --des 'Exp' --itr 5 --learning_rate 0.0001 --train_epochs 100 --patience 15
-```
-Then test the fine-tuned model on CUSTOM dataset:
-```bash
+
+# test
 python -u run.py --method LEAD --task_name finetune --is_training 0 --root_path ./dataset/ --model_id P-14-F-3-Base --model LEAD --data MultiDatasets \
 --testing_datasets CUSTOM \
 --e_layers 12 --batch_size 128 --n_heads 8 --d_model 128 --d_ff 256 --swa \
