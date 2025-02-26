@@ -19,6 +19,7 @@ from data_provider.dataset_loader.cognision_rseeg_loader import COGrsEEGLoader
 from data_provider.dataset_loader.cognision_erp_loader import COGERPLoader
 from data_provider.dataset_loader.adftd_loader import ADFTDLoader
 from data_provider.dataset_loader.cnbpm_loader import CNBPMLoader
+from data_provider.dataset_loader.caueeg_loader import CAUEEGLoader
 from data_provider.dataset_loader.brainlat_loader import BrainLatLoader
 from data_provider.dataset_loader.ad_auditory_loader import ADAuditoryLoader
 from data_provider.dataset_loader.tdbrain_loader import TBDRAINLoader
@@ -44,6 +45,7 @@ data_folder_dict = {
     # 5 downstream datasets
     'ADFTD': ADFTDLoader,  # ADFD with 19 channels
     'CNBPM': CNBPMLoader,  # CNBPM with 19 channels
+    'CAUEEG': CAUEEGLoader, # CAUEEG with 19 channels
     'Cognision-ERP-19': COGERPLoader,  # Cognision-ERP with 19 channels
     'Cognision-rsEEG-19': COGrsEEGLoader,  # Cognision-rsEEG with 19 channels
     'BrainLat-19': BrainLatLoader,  # BrainLat with 19 channels

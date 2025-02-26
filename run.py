@@ -8,6 +8,7 @@ from exp.exp_pretrain.exp_pretrain_moco import Exp_Pretrain_MOCO
 from exp.exp_pretrain.exp_pretrain_ts2vec import Exp_Pretrain_TS2Vec
 from exp.exp_pretrain.exp_pretrain_biot import Exp_Pretrain_BIOT
 from exp.exp_pretrain.exp_pretrain_eeg2rep import Exp_Pretrain_EEG2Rep
+from exp.exp_diffusion import Exp_Diffusion  # Import the new diffusion experiment class
 import random
 import numpy as np
 from utils.tools import compute_avg_std
@@ -21,7 +22,7 @@ if __name__ == '__main__':
                         help='Overall method (combinations of task_name, model, model_id) name, '
                              'options: [LEAD, MOCO, Transformer, TCN]')
     parser.add_argument('--task_name', type=str, required=True, default='supervised',
-                        help='task name, options:[supervised, pretrain_lead, pretrain_moco, finetune]')
+                        help='task name, options:[supervised, pretrain_lead, pretrain_moco, finetune, diffusion]')
     parser.add_argument('--model', type=str, required=True, default='LEAD',
                         help='backbone model name, options: [Transformer, TCN, LEAD]')
     parser.add_argument('--model_id', type=str, required=True, default='test', help='model id')
@@ -92,6 +93,11 @@ if __name__ == '__main__':
     parser.add_argument('--contrastive_loss', type=str, default='all',
                         help='contrastive loss modules enabled, options: [sample,subject,all]')
 
+    # Diffusion params
+    parser.add_argument('--n_steps', type=int, default=1000, help='Number of steps for diffusion process')
+    parser.add_argument('--time_diff_constraint', action='store_true', help='Whether to use time difference constraint in diffusion')
+    parser.add_argument('--init_diffusion', action='store_true', help='Initialize diffusion process in the model')
+    parser.add_argument('--sample_steps', type=int, default=50, help='Number of steps for sampling from diffusion model')
 
     # optimization
     # parser.add_argument('--num_workers', type=int, default=10, help='data loader num workers')
@@ -161,9 +167,12 @@ if __name__ == '__main__':
     elif args.task_name == 'finetune':
         print("Finetune")
         Exp = Exp_Finetune
+    elif args.task_name == 'diffusion':
+        print("Training with Diffusion method")
+        Exp = Exp_Diffusion
     else:
         raise ValueError('task_name unknown, should be supervised, pretrain_lead, pretrain_moco, '
-                         'pretrain_ts2vec, pretrain_biot, pretrain_eeg2rep or finetune.')
+                         'pretrain_ts2vec, pretrain_biot, pretrain_eeg2rep, finetune or diffusion.')
 
     total_params = 0
     sample_val_metrics_dict_list = []

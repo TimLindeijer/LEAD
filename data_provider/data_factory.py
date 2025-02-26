@@ -27,7 +27,8 @@ def data_provider(args, flag):
                 or args.task_name == 'pretrain_ts2vec' \
                 or args.task_name == 'pretrain_biot' \
                 or args.task_name == 'pretrain_eeg2rep' \
-                or args.task_name == 'finetune':
+                or args.task_name == 'finetune' \
+                or args.task_name == 'diffusion':  # Added diffusion here
             batch_size = args.batch_size
         else:
             batch_size = 1  # bsz=1 for evaluation
@@ -41,7 +42,8 @@ def data_provider(args, flag):
             or args.task_name == 'pretrain_ts2vec' \
             or args.task_name == 'pretrain_biot' \
             or args.task_name == 'pretrain_eeg2rep' \
-            or args.task_name == 'finetune':
+            or args.task_name == 'finetune' \
+            or args.task_name == 'diffusion':  # Added diffusion here
         drop_last = False
         data_set = Data(
             root_path=args.root_path,
@@ -55,25 +57,6 @@ def data_provider(args, flag):
             shuffle=shuffle_flag,
             num_workers=args.num_workers,
             drop_last=drop_last,
-            collate_fn=lambda x: collate_fn(x, max_len=args.seq_len)  # only called when yeilding batches
+            collate_fn=lambda x: collate_fn(x, max_len=args.seq_len)
         )
-        return data_set, data_loader
-
-    elif args.task_name == 'pretrain_lead':
-        data_set = Data(
-            root_path=args.root_path,
-            args=args,
-            flag=flag,
-        )
-
-        sampler = CustomGroupSampler(data_set, batch_size=batch_size,  group_size=2)
-        data_loader = DataLoader(
-            data_set,
-            batch_size=batch_size,
-            sampler=sampler,
-            num_workers=args.num_workers,
-            drop_last=drop_last,
-            collate_fn=lambda x: collate_fn(x, max_len=args.seq_len)  # only called when yielding batches
-        )
-
         return data_set, data_loader

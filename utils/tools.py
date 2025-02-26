@@ -347,3 +347,11 @@ def compute_avg_std(args, sample_val_metrics_dict_list, subject_val_metrics_dict
     print('Subject-level results after majority voting: \n')
     print(subject_val_results)
     print(subject_test_results)
+
+def test_params_flop(model):
+    """
+    Count the number of parameters in a model.
+    """
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f'Total number of parameters: {total_params}')
+    return total_params
