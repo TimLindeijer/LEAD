@@ -1,11 +1,13 @@
-from typing import Optional
+from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from layers.ADformer_EncDec import Encoder, EncoderLayer
 from layers.SelfAttention_Family import ADformerLayer
 from layers.Embed import TokenChannelEmbedding
+import math
 import numpy as np
+
 
 class DecoderLayer(nn.Module):
     """
@@ -36,90 +38,407 @@ class DecoderLayer(nn.Module):
         tgt = self.norm3(tgt + self.dropout(tgt2))
         return tgt
 
+
+class ArcMarginProduct(nn.Module):
+    """
+    Implement of large margin arc distance for subject classification.
+    
+    Args:
+        in_features: Size of each input sample
+        out_features: Size of each output sample (number of subjects)
+        s: Norm of input feature
+        m: Margin for angular distance
+        easy_margin: Use easy margin version
+    """
+    def __init__(self, in_features, out_features, s=30.0, m=0.50, easy_margin=False):
+        super(ArcMarginProduct, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.s = s
+        self.m = m
+        
+        # Initialize weight parameters
+        self.weight = nn.Parameter(torch.FloatTensor(out_features, in_features))
+        nn.init.xavier_uniform_(self.weight)
+        
+        # Pre-compute constants for margin computation
+        self.easy_margin = easy_margin
+        self.cos_m = math.cos(m)
+        self.sin_m = math.sin(m)
+        self.th = math.cos(math.pi - m)
+        self.mm = math.sin(math.pi - m) * m
+    
+    def forward(self, input, label):
+        """
+        Forward pass with Arc Margin.
+        
+        Args:
+            input: Feature vectors [batch, in_features]
+            label: Subject labels [batch]
+            
+        Returns:
+            Logits with margin applied [batch, out_features]
+        """
+        # Normalize input and weight
+        cosine = F.linear(F.normalize(input), F.normalize(self.weight))
+        
+        # Calculate sine
+        sine = torch.sqrt(1.0 - torch.pow(cosine, 2))
+        
+        # Apply margin
+        phi = cosine * self.cos_m - sine * self.sin_m
+        
+        # Apply margin conditions
+        if self.easy_margin:
+            phi = torch.where(cosine > 0, phi, cosine)
+        else:
+            phi = torch.where(cosine > self.th, phi, cosine - self.mm)
+        
+        # Apply one-hot encoding to labels
+        one_hot = torch.zeros_like(cosine, device=input.device)
+        one_hot.scatter_(1, label.view(-1, 1).long(), 1)
+        
+        # Apply margin to target classes only
+        output = (one_hot * phi) + ((1.0 - one_hot) * cosine)
+        
+        # Scale by s
+        output = output * self.s
+        
+        return output
+
+
+class ArcMarginHead(nn.Module):
+    """
+    ArcMargin classification head with feature projection layer.
+    
+    This simplified version doesn't depend on EEG_Net_8_Stack and can work with any input.
+    
+    Args:
+        in_features: Size of input features
+        hidden_features: Size of hidden layer (optional)
+        out_features: Number of output classes (subjects)
+        s: Scale factor for arc margin
+        m: Margin for arc distance
+    """
+    def __init__(self, in_features, out_features, hidden_features=None, s=30.0, m=0.50, easy_margin=False):
+        super(ArcMarginHead, self).__init__()
+        
+        # Optional feature projection layer
+        self.use_projection = hidden_features is not None
+        if self.use_projection:
+            self.projection = nn.Sequential(
+                nn.Linear(in_features, hidden_features),
+                nn.ReLU(),
+                nn.BatchNorm1d(hidden_features)
+            )
+            arc_input_dim = hidden_features
+        else:
+            arc_input_dim = in_features
+        
+        # Arc margin classification layer
+        self.arcpro = ArcMarginProduct(
+            arc_input_dim, 
+            out_features, 
+            s=s, 
+            m=m, 
+            easy_margin=easy_margin
+        )
+    
+    def forward(self, x, label):
+        """
+        Forward pass through projection and arcmargin.
+        
+        Args:
+            x: Input features [batch, in_features]
+            label: Subject labels [batch]
+            
+        Returns:
+            Classification logits with margin [batch, out_features]
+        """
+        # Optional feature projection
+        if self.use_projection:
+            # Make sure x is 2D
+            orig_shape = x.shape
+            if x.dim() > 2:
+                x = x.reshape(x.size(0), -1)
+            
+            # Project features
+            x = self.projection(x)
+        
+        # Apply ArcMargin classification
+        output = self.arcpro(x, label)
+        
+        return output
+
+
+class SubjectNoisePredictor(nn.Module):
+    """
+    Subject-specific noise prediction network.
+    
+    This network takes the noisy EEG signal and timestep as input,
+    and outputs a subject-specific noise prediction.
+    """
+    def __init__(self, configs):
+        super(SubjectNoisePredictor, self).__init__()
+        self.configs = configs
+        self.task_name = configs.task_name
+        self.seq_len = configs.seq_len
+        self.enc_in = configs.enc_in
+        self.d_model = configs.d_model
+        self.num_subjects = getattr(configs, 'num_subjects', 9)
+        
+        # Subject embedding
+        self.subject_embedding = nn.Embedding(self.num_subjects, self.d_model)
+        
+        # Timestep embedding
+        self.timestep_embed = nn.Embedding(configs.n_steps, self.d_model)
+        
+        # Encoder embedding
+        patch_len_list = list(map(int, configs.patch_len_list.split(",")))
+        up_dim_list = list(map(int, configs.up_dim_list.split(",")))
+        stride_list = patch_len_list
+        augmentations = configs.augmentations.split(",")
+        
+        self.enc_embedding = TokenChannelEmbedding(
+            configs.enc_in,
+            configs.seq_len,
+            configs.d_model,
+            patch_len_list,
+            up_dim_list,
+            stride_list,
+            configs.dropout,
+            augmentations,
+        )
+        
+        # Encoder for subject noise prediction
+        self.encoder = Encoder(
+            [
+                EncoderLayer(
+                    ADformerLayer(
+                        len(patch_len_list),
+                        len(up_dim_list),
+                        configs.d_model,
+                        configs.n_heads,
+                        configs.dropout,
+                        configs.output_attention,
+                        configs.no_inter_attn,
+                    ),
+                    configs.d_model,
+                    configs.d_ff,
+                    dropout=configs.dropout,
+                    activation=configs.activation,
+                )
+                for _ in range(configs.e_layers)
+            ],
+            norm_layer=torch.nn.LayerNorm(configs.d_model),
+        )
+        
+        # Projection for noise prediction
+        self.noise_projection = nn.Linear(
+            configs.d_model * len(patch_len_list) + configs.d_model * len(up_dim_list),
+            configs.enc_in * configs.seq_len
+        )
+        
+        # MLP for combining embeddings
+        self.combination_mlp = nn.Sequential(
+            nn.Linear(self.d_model * 2, self.d_model),
+            nn.ReLU(),
+            nn.Linear(self.d_model, self.d_model)
+        )
+        
+    def forward(self, x, t, s):
+        """
+        Forward pass for subject-specific noise prediction.
+        
+        Args:
+            x: Noisy input at time step t [batch, seq_len, channels]
+            t: Timestep indices [batch]
+            s: Subject indices [batch]
+            
+        Returns:
+            subject_mu: Subject-specific embeddings
+            subject_theta: Subject-specific noise prediction
+        """
+        batch_size = x.shape[0]
+        
+        # Get subject embedding
+        subject_emb = self.subject_embedding(s)  # [batch, d_model]
+        
+        # Get timestep embedding
+        time_emb = self.timestep_embed(t)  # [batch, d_model]
+        
+        # Combine subject and time embeddings
+        combined_emb = self.combination_mlp(
+            torch.cat([subject_emb, time_emb], dim=1)
+        )  # [batch, d_model]
+        
+        # Reshape input if needed for encoder
+        if x.dim() == 3:
+            # [batch, seq_len, channels] -> [batch, channels, seq_len]
+            x = x.permute(0, 2, 1)
+        
+        # Get encoder embeddings
+        enc_out_t, enc_out_c = self.enc_embedding(x)
+        
+        # Add subject-time embedding to encoder input
+        if isinstance(enc_out_t, list):
+            for i in range(len(enc_out_t)):
+                enc_out_t[i] = enc_out_t[i] + combined_emb.unsqueeze(1)
+        else:
+            enc_out_t = enc_out_t + combined_emb.unsqueeze(1)
+            
+        if isinstance(enc_out_c, list):
+            for i in range(len(enc_out_c)):
+                enc_out_c[i] = enc_out_c[i] + combined_emb.unsqueeze(1)
+        else:
+            enc_out_c = enc_out_c + combined_emb.unsqueeze(1)
+        
+        # Process through encoder
+        enc_out_t, enc_out_c, _, _ = self.encoder(enc_out_t, enc_out_c, attn_mask=None)
+        
+        # Combine encoder outputs
+        if enc_out_t is None:
+            memory = enc_out_c
+        elif enc_out_c is None:
+            memory = enc_out_t
+        else:
+            memory = torch.cat((enc_out_t, enc_out_c), dim=1)
+        
+        # Create subject-specific noise prediction
+        memory_flat = memory.reshape(batch_size, -1)
+        subject_theta_flat = self.noise_projection(memory_flat)
+        
+        # Reshape to match input dimensions
+        subject_theta = subject_theta_flat.reshape(x.shape)
+        
+        # Return both embeddings and noise prediction
+        return combined_emb, subject_theta
+
+
 class DenoiseDiffusion:
     """
-    ## Denoise Diffusion - Simplified implementation
+    Denoising Diffusion Probabilistic Model with subject-specific conditioning.
+    
+    This implements the DDPM algorithm as described in 
+    "Denoising Diffusion Probabilistic Models" by Ho et al. (2020)
+    with extensions for subject-specific EEG generation.
     """
-    def __init__(self, eps_model: nn.Module, n_steps: int, device: torch.device, time_diff_constraint=True):
+    def __init__(self, eps_model: nn.Module, n_steps: int, device: torch.device, 
+                 sub_theta: nn.Module = None, sub_arc_head: nn.Module = None,
+                 time_diff_constraint=True, debug=False):
         """
-        * `eps_model` is the model that predicts noise
-        * `n_steps` is number of diffusion steps
-        * `device` is the device to place constants on
+        Initialize the diffusion process with optional subject-specific components.
+        
+        Args:
+            eps_model: The model that predicts content noise
+            n_steps: Number of diffusion steps
+            device: The device to place constants on
+            sub_theta: Optional subject-specific noise prediction network
+            sub_arc_head: Optional ArcMargin classification head for subjects
+            time_diff_constraint: Whether to use time difference constraint
+            debug: Whether to print debug information
         """
         super().__init__()
         self.eps_model = eps_model
+        self.sub_theta = sub_theta
+        self.sub_arc_head = sub_arc_head
         self.time_diff_constraint = time_diff_constraint
         self.device = device
+        self.debug = debug
 
-        # Create beta schedule
+        # Create beta schedule (linearly increasing variance)
         self.beta = torch.linspace(0.0001, 0.02, n_steps).to(device)
+        
+        # Alpha values (1 - beta)
         self.alpha = 1. - self.beta
+        
+        # Cumulative product of alpha values
         self.alpha_bar = torch.cumprod(self.alpha, dim=0)
+        
+        # Number of timesteps
         self.n_steps = n_steps
+        
+        # Variance schedule
         self.sigma2 = self.beta
-    
-    def loss(self, x0: torch.Tensor, noise=None, debug=False):
-        """
-        Simplified diffusion loss function - handles shape mismatches automatically
-        """
-        # Get batch size
-        batch_size = x0.shape[0]
         
-        # Print input shape for debugging
+        # Parameters for time difference constraint
+        self.step_size = 75
+        self.window_size = 224
+        
+        # Number of possible subjects (needed for random sampling)
+        self.subject_noise_range = 9
+        
         if debug:
-            print(f"Input shape: {x0.shape}")
+            print(f"Initialized diffusion model with {n_steps} steps")
+            print(f"Beta range: {self.beta[0].item():.6f} to {self.beta[-1].item():.6f}")
+            if sub_theta is not None:
+                print("Subject-specific noise prediction network provided")
+            if sub_arc_head is not None:
+                print("Subject classification head provided")
+
+    def q_xt_x0(self, x0: torch.Tensor, t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Get q(x_t|x_0) distribution: the distribution of adding noise to x_0 to get x_t.
         
-        # Get random time steps from 0 to n_steps-1
-        t = torch.randint(0, self.n_steps, (batch_size,), device=x0.device, dtype=torch.long)
-        
-        # Generate random noise if not provided
-        if noise is None:
-            noise = torch.randn_like(x0)
+        Args:
+            x0: Original clean data [batch, seq_len, channels]
+            t: Timesteps [batch]
             
-        if debug:
-            print(f"Noise shape: {noise.shape}")
-        
-        # Get alpha_bar for the time steps
+        Returns:
+            mean: Mean of the conditional distribution q(x_t|x_0)
+            var: Variance of the conditional distribution q(x_t|x_0)
+        """
+        # Get alpha_bar_t for the given timesteps
         alpha_bar_t = self.alpha_bar[t]
         
         # Add dimensions for broadcasting
-        # For example, if x0 is [batch, seq_len, channels], we need alpha_bar to be [batch, 1, 1]
+        # For 3D input [batch, seq_len, channels], we need [batch, 1, 1]
         for _ in range(len(x0.shape) - 1):
             alpha_bar_t = alpha_bar_t.unsqueeze(-1)
-                
-        # Calculate noisy sample x_t
-        xt = torch.sqrt(alpha_bar_t) * x0 + torch.sqrt(1 - alpha_bar_t) * noise
         
-        if debug:
-            print(f"Noisy sample shape: {xt.shape}")
-            print(f"Timestep shape: {t.shape}")
+        # Mean: √(α̅_t) * x_0
+        mean = torch.sqrt(alpha_bar_t) * x0
         
-        # Predict noise - explicitly pass the timesteps
-        predicted_noise = self.eps_model(xt, t)
+        # Variance: (1 - α̅_t)
+        var = 1 - alpha_bar_t
         
-        if debug:
-            print(f"Predicted noise shape: {predicted_noise.shape}")
+        return mean, var
+
+    def q_sample(self, x0: torch.Tensor, t: torch.Tensor, eps: Optional[torch.Tensor] = None):
+        """
+        Sample from q(x_t|x_0): add noise to x_0 according to the diffusion schedule.
         
-        # If shapes don't match, try to reshape
-        if predicted_noise.shape != noise.shape:
-            if debug:
-                print(f"Shape mismatch: Predicted {predicted_noise.shape}, Expected {noise.shape}")
-            try:
-                predicted_noise = predicted_noise.view(noise.shape)
-            except:
-                # If reshape fails, log and continue
-                if debug:
-                    print("Reshape failed, falling back to MSE loss between differently shaped tensors")
+        Args:
+            x0: Original clean data [batch, seq_len, channels]
+            t: Timesteps [batch]
+            eps: Optional pre-generated noise (if None, will be sampled)
+            
+        Returns:
+            x_t: Noisy samples at timestep t
+        """
+        # Generate random noise if not provided
+        if eps is None:
+            eps = torch.randn_like(x0)
         
-        # MSE loss
-        return F.mse_loss(noise, predicted_noise)
-    
+        # Get mean and variance of q(x_t|x_0)
+        mean, var = self.q_xt_x0(x0, t)
+        
+        # Sample from q(x_t|x_0) = N(mean, var)
+        # x_t = √(α̅_t) * x_0 + √(1 - α̅_t) * ε
+        return mean + torch.sqrt(var) * eps
+
     def p_sample(self, xt: torch.Tensor, t: torch.Tensor):
         """
-        Sample from p_θ(x_{t-1}|x_t)
-        Simplified implementation that handles different shapes
+        Sample from p_θ(x_{t-1}|x_t): perform one denoising step.
+        
+        Args:
+            xt: Noisy input at time step t [batch, seq_len, channels]
+            t: Timestep indices [batch]
+            
+        Returns:
+            x_{t-1}: Sample with less noise (one step of denoising)
         """
-        # Predict noise
+        # Predict noise using the model
         predicted_noise = self.eps_model(xt, t)
         
         # Make sure predicted_noise has the same shape as xt
@@ -127,10 +446,11 @@ class DenoiseDiffusion:
             try:
                 predicted_noise = predicted_noise.view(xt.shape)
             except:
-                # If reshape fails, just continue with current shape
-                pass
+                # If reshape fails, log a warning
+                if self.debug:
+                    print(f"Warning: Shape mismatch in p_sample. Predicted: {predicted_noise.shape}, Expected: {xt.shape}")
         
-        # Get parameters
+        # Get parameters from the noise schedule
         alpha_t = self.alpha[t]
         alpha_bar_t = self.alpha_bar[t]
         beta_t = self.beta[t]
@@ -141,17 +461,386 @@ class DenoiseDiffusion:
             alpha_bar_t = alpha_bar_t.unsqueeze(-1)
             beta_t = beta_t.unsqueeze(-1)
         
-        # Calculate mean for p_θ(x_{t-1}|x_t)
-        mean = (1 / torch.sqrt(alpha_t)) * (xt - (beta_t / torch.sqrt(1 - alpha_bar_t)) * predicted_noise)
+        # Calculate the mean for p_θ(x_{t-1}|x_t)
+        # μ_θ(x_t, t) = (1/√α_t) * (x_t - (β_t/√(1-α̅_t)) * ε_θ(x_t, t))
+        eps_coef = beta_t / torch.sqrt(1 - alpha_bar_t)
+        mean = (1 / torch.sqrt(alpha_t)) * (xt - eps_coef * predicted_noise)
         
         # Variance
-        var = beta_t * (1 - alpha_bar_t.to(torch.float32) / (1 - alpha_bar_t))
+        # In DDPM paper, the variance is either fixed to β_t or learned
+        # Here we use the fixed variance schedule
+        var = beta_t
         
         # Sample noise
         noise = torch.randn_like(xt)
         
+        # Only add noise if t > 0, otherwise just return the mean
+        # This ensures x_0 is deterministic and not noisy
+        is_last_step = (t == 0).view((-1,) + (1,) * (len(xt.shape) - 1))
+        noise = torch.where(is_last_step, 0.0, noise)
+        
         # Return sample
         return mean + torch.sqrt(var) * noise
+    
+    def p_sample_noise(self, xt: torch.Tensor, t: torch.Tensor, s: torch.Tensor):
+        """
+        Sample from p_θ(x_{t-1}|x_t) with subject-specific conditioning.
+        
+        Args:
+            xt: Noisy input at time step t [batch, seq_len, channels]
+            t: Timestep indices [batch]
+            s: Subject indices for conditioning [batch]
+            
+        Returns:
+            x_{t-1}: Sample with less noise, conditioned on subject
+        """
+        if not hasattr(self, 'sub_theta') or self.sub_theta is None:
+            raise ValueError("Subject-specific network not available for conditional sampling")
+        
+        # Get subject-specific noise prediction
+        subject_mu, subject_theta = self.sub_theta(xt, t, s)
+        
+        # Get parameters from the noise schedule
+        alpha_t = self.alpha[t]
+        alpha_bar_t = self.alpha_bar[t]
+        beta_t = self.beta[t]
+        
+        # Add dimensions for broadcasting
+        for _ in range(len(xt.shape) - 1):
+            alpha_t = alpha_t.unsqueeze(-1)
+            alpha_bar_t = alpha_bar_t.unsqueeze(-1)
+            beta_t = beta_t.unsqueeze(-1)
+        
+        # Calculate the mean
+        eps_coef = beta_t / torch.sqrt(1 - alpha_bar_t)
+        mean = (1 / torch.sqrt(alpha_t)) * (xt - eps_coef * subject_theta)
+        
+        # Variance
+        var = beta_t
+        
+        # Sample noise
+        eps = torch.randn_like(xt)
+        
+        # Only add noise if t > 0
+        is_last_step = (t == 0).view((-1,) + (1,) * (len(xt.shape) - 1))
+        eps = torch.where(is_last_step, 0.0, eps)
+        
+        # Return sample
+        return mean + torch.sqrt(var) * eps
+
+    def loss(self, x0: torch.Tensor, noise: Optional[torch.Tensor] = None, debug=False):
+        """
+        Calculate the simplified diffusion loss:
+        L_simple = E_t,x_0,ε[||ε - ε_θ(x_t, t)||^2]
+        
+        Args:
+            x0: Original clean data [batch, seq_len, channels]
+            noise: Optional pre-generated noise
+            debug: Whether to print debug information
+            
+        Returns:
+            loss: The MSE loss between predicted and actual noise
+        """
+        local_debug = debug or self.debug
+        batch_size = x0.shape[0]
+        
+        if local_debug:
+            print(f"Input shape: {x0.shape}")
+        
+        # Sample random timesteps
+        t = torch.randint(0, self.n_steps, (batch_size,), device=x0.device, dtype=torch.long)
+        
+        # Generate random noise if not provided
+        if noise is None:
+            noise = torch.randn_like(x0)
+            
+        if local_debug:
+            print(f"Noise shape: {noise.shape}")
+        
+        # Get noisy samples x_t at timestep t
+        xt = self.q_sample(x0, t, eps=noise)
+        
+        if local_debug:
+            print(f"Noisy sample shape: {xt.shape}")
+            print(f"Timestep shape: {t.shape}")
+        
+        # Predict noise
+        predicted_noise = self.eps_model(xt, t)
+        
+        if local_debug:
+            print(f"Predicted noise shape: {predicted_noise.shape}")
+        
+        # Handle shape mismatch if necessary
+        if predicted_noise.shape != noise.shape:
+            if local_debug:
+                print(f"Shape mismatch: Predicted {predicted_noise.shape}, Expected {noise.shape}")
+            try:
+                predicted_noise = predicted_noise.view(noise.shape)
+            except:
+                if local_debug:
+                    print("Reshape failed, falling back to MSE loss between differently shaped tensors")
+        
+        # Calculate time difference constraint penalty if enabled
+        constraint_penalty = 0
+        if self.time_diff_constraint and len(x0.shape) >= 3 and x0.shape[1] > 1:
+            # Example constraint: adjacent time steps should have similar noise predictions
+            # This encourages temporal consistency in the generated signals
+            time_dim = 1  # Usually time is dimension 1 in [batch, time, channels]
+            for i in range(predicted_noise.shape[time_dim] - 1):
+                constraint_penalty += F.mse_loss(
+                    predicted_noise[:, i+1], 
+                    predicted_noise[:, i], 
+                    reduction='mean'
+                )
+            constraint_penalty /= (predicted_noise.shape[time_dim] - 1)
+            
+            if local_debug:
+                print(f"Time difference constraint penalty: {constraint_penalty.item():.6f}")
+        
+        # MSE loss between predicted and actual noise
+        noise_loss = F.mse_loss(noise, predicted_noise)
+        
+        # Add constraint with a weight if enabled
+        total_loss = noise_loss
+        if self.time_diff_constraint:
+            constraint_weight = 0.1  # Adjust as needed
+            total_loss = noise_loss + constraint_weight * constraint_penalty
+        
+        return total_loss
+
+    def loss_with_diff_constraint(self, x0: torch.Tensor, label: torch.Tensor, 
+                                noise: Optional[torch.Tensor] = None, debug=False, 
+                                noise_content_kl_co=1.0, arc_subject_co=0.1, orgth_co=2.0):
+        """
+        Enhanced loss function with multiple constraints for better EEG generation.
+        
+        Args:
+            x0: Original clean data [batch, seq_len, channels]
+            label: Subject labels for classification [batch]
+            noise: Optional pre-generated noise
+            debug: Whether to print debug information
+            noise_content_kl_co: Weight for KL divergence loss
+            arc_subject_co: Weight for subject classification loss
+            orgth_co: Weight for orthogonality loss
+            
+        Returns:
+            total_loss: The combined loss value
+            constraint_penalty: Time difference constraint penalty value
+            noise_content_kl: KL divergence between content and subject-specific noise
+            subject_arc_loss: Subject classification loss
+            loss_orth: Orthogonality loss value
+        """
+        local_debug = debug or self.debug
+        batch_size = x0.shape[0]
+        
+        # Get random timesteps
+        t = torch.randint(0, self.n_steps, (batch_size,), device=x0.device, dtype=torch.long)
+        
+        # Use subject labels
+        s = label
+        
+        if local_debug:
+            print(f"Input shape: {x0.shape}")
+            print(f"Timestep shape: {t.shape}")
+            print(f"Label shape: {s.shape}")
+        
+        # Generate random noise if not provided
+        if noise is None:
+            noise = torch.randn_like(x0)
+        
+        # Get noisy samples x_t at timestep t
+        xt = self.q_sample(x0, t, eps=noise)
+        
+        if local_debug:
+            print(f"Noisy sample shape: {xt.shape}")
+        
+        # Get content-specific noise prediction
+        eps_theta = self.eps_model(xt, t)
+        
+        # Get subject-specific noise prediction using the subject embedding network
+        if hasattr(self, 'sub_theta') and self.sub_theta is not None:
+            subject_mu, subject_theta = self.sub_theta(xt, t, s)
+        else:
+            # If no subject network is available, create zero tensor with same shape
+            subject_theta = torch.zeros_like(eps_theta)
+            subject_mu = torch.zeros_like(eps_theta)
+        
+        if local_debug:
+            print(f"Content noise shape: {eps_theta.shape}")
+            print(f"Subject noise shape: {subject_theta.shape}")
+        
+        # Calculate time difference constraint penalty
+        constraint_penalty = 0
+        if self.time_diff_constraint and xt.dim() >= 3 and xt.shape[1] > 1:
+            # For EEG data, typically time is dimension 1
+            time_dim = 1
+            step_size = getattr(self, 'step_size', 1)
+            
+            # Calculate penalty for adjacent time windows to ensure smoothness
+            for i in range(eps_theta.shape[time_dim] - step_size):
+                constraint_penalty += F.mse_loss(
+                    eps_theta[:, i+step_size], 
+                    eps_theta[:, i], 
+                    reduction='mean'
+                )
+            constraint_penalty /= (eps_theta.shape[time_dim] - step_size)
+        
+        # Calculate orthogonality loss between content and subject components
+        # This encourages content and subject noise to be independent
+        if eps_theta.dim() >= 3:
+            # Reshape for matrix multiplication
+            eps_flat = eps_theta.reshape(eps_theta.shape[0]*eps_theta.shape[1], -1)
+            subj_flat = subject_theta.reshape(subject_theta.shape[0]*subject_theta.shape[1], -1)
+            
+            # Matrix product
+            organal_squad = torch.bmm(
+                eps_flat.unsqueeze(1), 
+                subj_flat.unsqueeze(2)
+            ).squeeze()
+            
+            # Create mask to penalize non-diagonal elements
+            diag_size = organal_squad.shape[0]
+            ones = torch.ones(diag_size, device=organal_squad.device)
+            diag = torch.eye(diag_size, device=organal_squad.device)
+            
+            # Compute orthogonality loss
+            loss_orth = ((organal_squad * (ones - diag)) ** 2).mean()
+        else:
+            # Fallback if dimensions don't match
+            loss_orth = torch.tensor(0.0, device=x0.device)
+        
+        # Calculate KL divergence between content and subject-specific noise distributions
+        noise_content_kl = F.kl_div(
+            F.log_softmax(eps_theta.reshape(-1, eps_theta.shape[-1]), dim=-1),
+            F.softmax(subject_theta.reshape(-1, subject_theta.shape[-1]), dim=-1),
+            reduction='mean'
+        )
+        
+        # Calculate subject classification loss using ArcMargin if available
+        if hasattr(self, 'sub_arc_head') and self.sub_arc_head is not None:
+            # Reshape subject_theta for classification
+            if subject_theta.dim() >= 3:
+                # Adjust dimensions for ArcMargin input
+                arc_input = subject_theta.permute(0, 2, 1).mean(dim=2)
+            else:
+                arc_input = subject_theta
+                
+            # Get logits from ArcMargin head
+            subject_arc_logit = self.sub_arc_head(arc_input, s)
+            
+            # Calculate cross entropy loss
+            subject_arc_loss = F.cross_entropy(subject_arc_logit, s.long())
+        else:
+            # If ArcMargin is not available, use zero loss
+            subject_arc_loss = torch.tensor(0.0, device=x0.device)
+        
+        # Combine all loss components
+        noise_prediction_loss = F.mse_loss(noise, eps_theta + subject_theta)
+        
+        # Apply weights to each component
+        total_loss = noise_prediction_loss
+        
+        if self.time_diff_constraint:
+            constraint_weight = 0.1
+            total_loss = total_loss + constraint_weight * constraint_penalty
+        
+        if orgth_co > 0:
+            total_loss = total_loss + orgth_co * loss_orth
+        
+        if arc_subject_co > 0 and hasattr(self, 'sub_arc_head'):
+            total_loss = total_loss + arc_subject_co * subject_arc_loss
+        
+        if noise_content_kl_co > 0:
+            total_loss = total_loss - noise_content_kl_co * noise_content_kl
+        
+        if local_debug:
+            print(f"Noise prediction loss: {noise_prediction_loss.item():.6f}")
+            print(f"Constraint penalty: {constraint_penalty.item() if isinstance(constraint_penalty, torch.Tensor) else constraint_penalty:.6f}")
+            print(f"Orthogonality loss: {loss_orth.item():.6f}")
+            print(f"Subject arc loss: {subject_arc_loss.item():.6f}")
+            print(f"KL divergence: {noise_content_kl.item():.6f}")
+            print(f"Total loss: {total_loss.item():.6f}")
+        
+        return total_loss, constraint_penalty, noise_content_kl, subject_arc_loss, loss_orth
+
+    def sample(self, shape, sample_steps=None):
+        """
+        Generate new samples from the diffusion model.
+        
+        Args:
+            shape: Shape of samples to generate [batch, seq_len, channels]
+            sample_steps: Number of sampling steps (if None, uses n_steps)
+            
+        Returns:
+            Samples generated by the diffusion process
+        """
+        if sample_steps is None:
+            sample_steps = self.n_steps
+            
+        # Start from pure noise
+        batch_size = shape[0]
+        device = self.device
+        
+        # Sample x_T from standard normal distribution
+        x = torch.randn(shape, device=device)
+        
+        # Progressively denoise x_t for t = T, T-1, ..., 1
+        for t_step in range(sample_steps):
+            # Current timestep (going backwards)
+            t = self.n_steps - t_step - 1
+            
+            # Create a batch of timesteps
+            t_batch = torch.full((batch_size,), t, device=device, dtype=torch.long)
+            
+            # Sample from p(x_{t-1} | x_t)
+            with torch.no_grad():
+                x = self.p_sample(x, t_batch)
+                
+        return x
+    
+    def sample_with_subject(self, shape, subject_ids, sample_steps=None):
+        """
+        Generate new samples conditioned on subject IDs.
+        
+        Args:
+            shape: Shape of samples to generate [batch, seq_len, channels]
+            subject_ids: Subject IDs to condition on [batch]
+            sample_steps: Number of sampling steps (if None, uses n_steps)
+            
+        Returns:
+            Samples generated by the subject-conditioned diffusion process
+        """
+        if not hasattr(self, 'sub_theta') or self.sub_theta is None:
+            raise ValueError("Subject-specific network not available for conditional sampling")
+            
+        if sample_steps is None:
+            sample_steps = self.n_steps
+            
+        # Start from pure noise
+        batch_size = shape[0]
+        device = self.device
+        
+        # Convert subject_ids to tensor if needed
+        if not isinstance(subject_ids, torch.Tensor):
+            subject_ids = torch.tensor(subject_ids, device=device)
+        
+        # Sample x_T from standard normal
+        x = torch.randn(shape, device=device)
+        
+        # Progressively denoise with subject conditioning
+        for t_step in range(sample_steps):
+            # Current timestep (going backwards)
+            t = self.n_steps - t_step - 1
+            
+            # Create a batch of timesteps
+            t_batch = torch.full((batch_size,), t, device=device, dtype=torch.long)
+            
+            # Sample from p(x_{t-1} | x_t) with subject conditioning
+            with torch.no_grad():
+                x = self.p_sample_noise(x, t_batch, subject_ids)
+                
+        return x
+
 
 class Model(nn.Module):
     """
@@ -349,41 +1038,59 @@ class Model(nn.Module):
         Returns:
             Predicted noise - same shape as input
         """
-        # Print input shape for debugging
-        # print(f"Input shape to diffusion_forward: {xt.shape}")
-        
         # Store original shape for output reshaping
         original_shape = xt.shape
-        batch_size, seq_len, channels = xt.shape
+        batch_size = xt.shape[0]
         
         # Check if t is None and create a default t if needed
         if t is None:
             # Use timestep 0 as default
             t = torch.zeros(batch_size, dtype=torch.long, device=xt.device)
         
-        # Create a flattened representation
-        xt_flat = xt.reshape(batch_size, -1)  # [batch, seq_len*channels]
+        # Get timestep embeddings
+        t_emb = self.timestep_embed(t)  # [batch, d_model]
         
-        # Get timestep embeddings - [batch, embedding_dim]
-        t_emb = self.timestep_embed(t)
+        # Process through encoder
+        enc_out_t, enc_out_c = self.enc_embedding(xt)
         
-        # Combine input and timestep embedding
-        combined = torch.cat([xt_flat, t_emb], dim=1)
-        
-        # Use the MLP for noise prediction
-        if hasattr(self, 'diffusion_mlp'):
-            # Use the dedicated MLP if available
-            noise_pred_flat = self.diffusion_mlp(combined)
+        # Inject timestep embedding into encoder outputs
+        if isinstance(enc_out_t, list):
+            for i in range(len(enc_out_t)):
+                enc_out_t[i] = enc_out_t[i] + t_emb.unsqueeze(1)
         else:
-            # Create on-the-fly MLPs (not ideal for performance, but works)
-            hidden_dim = self.d_model * 2  # Adjust as needed
-            hidden = F.relu(nn.Linear(combined.shape[1], hidden_dim).to(xt.device)(combined))
-            hidden = F.dropout(hidden, p=0.1, training=self.training)
-            output_size = seq_len * channels
-            noise_pred_flat = nn.Linear(hidden_dim, output_size).to(xt.device)(hidden)
+            enc_out_t = enc_out_t + t_emb.unsqueeze(1)
+            
+        if isinstance(enc_out_c, list):
+            for i in range(len(enc_out_c)):
+                enc_out_c[i] = enc_out_c[i] + t_emb.unsqueeze(1)
+        else:
+            enc_out_c = enc_out_c + t_emb.unsqueeze(1)
         
-        # Reshape back to original shape
-        noise_pred = noise_pred_flat.reshape(original_shape)
+        # Process through encoder
+        enc_out_t, enc_out_c, _, _ = self.encoder(enc_out_t, enc_out_c, attn_mask=None)
+        
+        # Combine encoder outputs
+        if enc_out_t is None:
+            enc_out = enc_out_c
+        elif enc_out_c is None:
+            enc_out = enc_out_t
+        else:
+            enc_out = torch.cat((enc_out_t, enc_out_c), dim=1)
+        
+        # Apply activation and dropout
+        output = self.act(enc_out)
+        output = self.dropout(output)
+        
+        # Flatten and predict noise
+        output_flat = output.reshape(batch_size, -1)
+        noise_pred_flat = self.noise_pred(output_flat)
+        
+        # Reshape to original input shape
+        # The noise_pred expects to output [batch, channels, seq_len]
+        # but we might need to reshape to match input [batch, seq_len, channels]
+        noise_pred = noise_pred_flat
+        if noise_pred.shape != original_shape:
+            noise_pred = noise_pred.view(original_shape)
         
         return noise_pred
     
@@ -393,13 +1100,6 @@ class Model(nn.Module):
         For diffusion task, t contains timestep indices.
         """
         if self.task_name == "diffusion":
-            # Check input shape and print for debugging
-            # print(f"Forward diffusion input shape: {x_enc.shape}")
-            # if t is not None:
-            #     print(f"Timestep shape: {t.shape}")
-            # else:
-            #     print("Timestep is None")
-                
             return self.diffusion_forward(x_enc, t)
         elif self.task_name in ["supervised", "finetune"]:
             return self.supervised(x_enc, x_mark_enc)

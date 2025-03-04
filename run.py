@@ -87,7 +87,7 @@ if __name__ == '__main__':
     parser.add_argument('--temperature', type=float, default=0.07, help='Temperature for the softmax in MOCO method')
 
     # EEG2Rpe params
-    parser.add_argument('--mask_ratio', type=float, default=0.5, help=" masking ratio")
+    parser.add_argument('--mask_ratio', type=float, default=0.5, help="masking ratio")
 
     # LEAD params
     parser.add_argument('--contrastive_loss', type=str, default='all',
@@ -95,12 +95,23 @@ if __name__ == '__main__':
 
     # Diffusion params
     parser.add_argument('--n_steps', type=int, default=1000, help='Number of steps for diffusion process')
+    parser.add_argument('--sample_steps', type=int, default=50, help='Number of steps for sampling from diffusion model')
     parser.add_argument('--time_diff_constraint', action='store_true', help='Whether to use time difference constraint in diffusion')
     parser.add_argument('--init_diffusion', action='store_true', help='Initialize diffusion process in the model')
-    parser.add_argument('--sample_steps', type=int, default=50, help='Number of steps for sampling from diffusion model')
+    parser.add_argument('--arc_margin_s', type=float, default=30.0, help='Scale factor for ArcMargin')
+    parser.add_argument('--arc_margin_m', type=float, default=0.5, help='Margin for ArcMargin')
+    parser.add_argument('--arc_easy_margin', action='store_true', help='Use easy margin for ArcMargin', default=False)
+    parser.add_argument('--num_subjects', type=int, default=9, help='Number of subjects for conditioning')
+    parser.add_argument('--noise_content_kl_co', type=float, default=1.0, help='Weight for KL divergence loss')
+    parser.add_argument('--arc_subject_co', type=float, default=0.1, help='Weight for subject classification loss')
+    parser.add_argument('--orgth_co', type=float, default=2.0, help='Weight for orthogonality loss')
+    parser.add_argument('--generate_samples', action='store_true', help='Generate samples during testing', default=False)
+    parser.add_argument('--subject_conditional', action='store_true', help='Enable subject conditioning for diffusion', default=True)
+    parser.add_argument('--arc_hidden_features', type=int, default=None, help='Size of hidden layer in ArcMargin projection (None for no projection)')
+    parser.add_argument('--save_samples', action='store_true', help='Save generated samples to disk', default=False)
+    parser.add_argument('--samples_path', type=str, default='./generated_samples/', help='Path to save generated samples')
 
     # optimization
-    # parser.add_argument('--num_workers', type=int, default=10, help='data loader num workers')
     parser.add_argument('--num_workers', type=int, default=0, help='data loader num workers')
     parser.add_argument('--itr', type=int, default=1, help='experiments times')
     parser.add_argument('--train_epochs', type=int, default=10, help='train epochs')
@@ -125,7 +136,6 @@ if __name__ == '__main__':
     parser.add_argument('--use_gpu', type=bool, default=True, help='use gpu')
     parser.add_argument('--gpu', type=int, default=0, help='gpu')
     parser.add_argument('--use_multi_gpu', action='store_true', help='use multiple gpus', default=True)
-    # parser.add_argument('--devices', type=str, default='0,1,2,3', help='device ids of multiple gpus')
     parser.add_argument('--devices', type=str, default='0', help='device ids of multiple gpus')
 
     # de-stationary projector params
@@ -197,20 +207,10 @@ if __name__ == '__main__':
             # setting record of experiments
             args.seed = seed
             setting = 'nh{}_el{}_dm{}_df{}_seed{}'.format(
-                # args.model_id,
-                # args.features,
-                # args.seq_len,
-                # args.label_len,
-                # args.pred_len,
                 args.n_heads,
                 args.e_layers,
-                # args.d_layers,
                 args.d_model,
                 args.d_ff,
-                # args.factor,
-                # args.embed,
-                # args.distil,
-                # args.des,
                 args.seed
             )
 
@@ -226,6 +226,12 @@ if __name__ == '__main__':
             subject_val_metrics_dict_list.append(subject_val_metrics_dict)
             sample_test_metrics_dict_list.append(sample_test_metrics_dict)
             subject_test_metrics_dict_list.append(subject_test_metrics_dict)
+            
+            # Generate samples if requested (for diffusion models)
+            if args.task_name == 'diffusion' and args.generate_samples:
+                print('>>>>>>>generating samples : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
+                exp.generate_samples(setting)
+                
             torch.cuda.empty_cache()
         compute_avg_std(args, sample_val_metrics_dict_list, subject_val_metrics_dict_list,
                         sample_test_metrics_dict_list, subject_test_metrics_dict_list, total_params)
@@ -247,20 +253,10 @@ if __name__ == '__main__':
 
             args.seed = seed
             setting = 'nh{}_el{}_dm{}_df{}_seed{}'.format(
-                # args.model_id,
-                # args.features,
-                # args.seq_len,
-                # args.label_len,
-                # args.pred_len,
                 args.n_heads,
                 args.e_layers,
-                # args.d_layers,
                 args.d_model,
                 args.d_ff,
-                # args.factor,
-                # args.embed,
-                # args.distil,
-                # args.des,
                 args.seed
             )
 
@@ -273,6 +269,12 @@ if __name__ == '__main__':
             subject_val_metrics_dict_list.append(subject_val_metrics_dict)
             sample_test_metrics_dict_list.append(sample_test_metrics_dict)
             subject_test_metrics_dict_list.append(subject_test_metrics_dict)
+            
+            # Generate samples if requested (for diffusion models)
+            if args.task_name == 'diffusion' and args.generate_samples:
+                print('>>>>>>>generating samples : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
+                exp.generate_samples(setting)
+                
             torch.cuda.empty_cache()
         compute_avg_std(args, sample_val_metrics_dict_list, subject_val_metrics_dict_list,
                         sample_test_metrics_dict_list, subject_test_metrics_dict_list, total_params)
