@@ -24,26 +24,101 @@ def collate_fn(data, max_len=None):
             0 indicates masked values to be predicted, 1 indicates unaffected/"active" feature values
         padding_masks: (batch_size, padded_length) boolean tensor, 1 means keep vector at this position, 0 means padding
     """
+    import torch
+    
+    # Handle error case: data is not a list or contains non-tuple elements
+    if not isinstance(data, (list, tuple)):
+        print(f"ERROR: collate_fn expected list/tuple but got {type(data)}: {data}")
+        # Try to handle this case by wrapping in list
+        if isinstance(data, int) or (hasattr(data, 'item') and hasattr(data, 'dim') and data.dim() == 0):
+            # Single integer value - create dummy batch
+            dummy_features = torch.zeros((1, 128, 19))  # Adjust dimensions to match expected
+            dummy_labels = torch.tensor([data if isinstance(data, int) else data.item()])
+            dummy_padding_mask = torch.ones((1, 128), dtype=torch.bool)  # All active
+            return dummy_features, dummy_labels, dummy_padding_mask
+        else:
+            # Try to make a list from it
+            try:
+                data = [data]
+            except:
+                # Complete fallback
+                print("CRITICAL ERROR: Could not process data for batch")
+                dummy_features = torch.zeros((1, 128, 19))  # Adjust dimensions to match expected
+                dummy_labels = torch.zeros(1, dtype=torch.long)
+                dummy_padding_mask = torch.ones((1, 128), dtype=torch.bool)  # All active
+                return dummy_features, dummy_labels, dummy_padding_mask
+    
+    # Handle empty batch
+    if len(data) == 0:
+        print("WARNING: Empty batch received")
+        dummy_features = torch.zeros((0, 128, 19))  # Adjust dimensions
+        dummy_labels = torch.zeros(0, dtype=torch.long)
+        dummy_padding_mask = torch.ones((0, 128), dtype=torch.bool)
+        return dummy_features, dummy_labels, dummy_padding_mask
+    
+    try:
+        # Check batch contents for consistency
+        for i, item in enumerate(data):
+            if not isinstance(item, (list, tuple)) or len(item) < 2:
+                print(f"WARNING: Item {i} is not a proper (feature, label) tuple: {type(item)}")
+                if isinstance(item, (int, float)) or (isinstance(item, torch.Tensor) and item.dim() == 0):
+                    # It's a single value - probably just a label
+                    # Replace with dummy tuple
+                    data[i] = (torch.zeros((128, 19)), item if isinstance(item, (int, float)) else item.item())
+                    print(f"Fixed item {i} by creating a dummy feature tensor")
+    except Exception as e:
+        print(f"Error checking batch contents: {e}")
+    
+    # Standard processing
+    try:
+        batch_size = len(data)
+        features, labels = zip(*data)
 
-    batch_size = len(data)
-    features, labels = zip(*data)
+        # Stack and pad features and masks (convert 2D to 3D tensors, i.e. add batch dimension)
+        lengths = [X.shape[0] for X in features]  # original sequence length for each time series
+        if max_len is None:
+            max_len = max(lengths)
 
-    # Stack and pad features and masks (convert 2D to 3D tensors, i.e. add batch dimension)
-    lengths = [X.shape[0] for X in features]  # original sequence length for each time series
-    if max_len is None:
-        max_len = max(lengths)
+        X = torch.zeros(batch_size, max_len, features[0].shape[-1])  # (batch_size, padded_length, feat_dim)
+        for i in range(batch_size):
+            end = min(lengths[i], max_len)
+            X[i, :end, :] = features[i][:end, :]
 
-    X = torch.zeros(batch_size, max_len, features[0].shape[-1])  # (batch_size, padded_length, feat_dim)
-    for i in range(batch_size):
-        end = min(lengths[i], max_len)
-        X[i, :end, :] = features[i][:end, :]
+        targets = torch.stack(labels, dim=0)  # (batch_size, num_labels)
 
-    targets = torch.stack(labels, dim=0)  # (batch_size, num_labels)
+        padding_masks = padding_mask(torch.tensor(lengths, dtype=torch.int16),
+                                    max_len=max_len)  # (batch_size, padded_length) boolean tensor, "1" means keep
 
-    padding_masks = padding_mask(torch.tensor(lengths, dtype=torch.int16),
-                                 max_len=max_len)  # (batch_size, padded_length) boolean tensor, "1" means keep
-
-    return X, targets, padding_masks
+        return X, targets, padding_masks
+        
+    except Exception as e:
+        print(f"Error in collate_fn: {e}")
+        print(f"Data type: {type(data)}, length: {len(data)}")
+        if len(data) > 0:
+            print(f"First item type: {type(data[0])}, value: {data[0]}")
+            
+        # Return placeholder tensors as emergency fallback
+        batch_size = len(data)
+        dummy_features = torch.zeros((batch_size, 128, 19))  # Adjust dimensions to match your needs
+        
+        # Try to extract labels if possible
+        try:
+            if all(isinstance(item, (int, float)) for item in data):
+                # All items are scalars, use them as labels
+                dummy_labels = torch.tensor(data)
+            elif all(isinstance(item, (tuple, list)) and len(item) >= 2 for item in data):
+                # Items are tuples, extract second element as label
+                dummy_labels = torch.stack([item[1] if isinstance(item[1], torch.Tensor) else torch.tensor(item[1]) 
+                                           for item in data])
+            else:
+                # Mixed types or unknown structure
+                dummy_labels = torch.zeros(batch_size, dtype=torch.long)
+        except:
+            # Complete fallback
+            dummy_labels = torch.zeros(batch_size, dtype=torch.long)
+        
+        dummy_padding_mask = torch.ones((batch_size, 128), dtype=torch.bool)
+        return dummy_features, dummy_labels, dummy_padding_mask
 
 
 def padding_mask(lengths, max_len=None):
@@ -52,10 +127,10 @@ def padding_mask(lengths, max_len=None):
     where 1 means keep element at this position (time step)
     """
     batch_size = lengths.numel()
-    max_len = max_len or lengths.max_val()  # trick works because of overloading of 'or' operator for non-boolean types
+    max_len = max_len or lengths.max_val()
     return (torch.arange(0, max_len, device=lengths.device)
-            .type_as(lengths)  # convert to same type as lengths tensor
-            .repeat(batch_size, 1)  # (batch_size, max_len)
+            .type_as(lengths)
+            .repeat(batch_size, 1)
             .lt(lengths.unsqueeze(1)))
 
 

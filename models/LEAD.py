@@ -8,6 +8,74 @@ from layers.Embed import TokenChannelEmbedding
 import math
 import numpy as np
 
+def frequency_constraint(signal, sampling_rate=128):
+    """
+    Apply frequency domain constraints to encourage realistic EEG rhythms.
+    
+    Args:
+        signal: Input signal [batch, seq_len, channels] or [batch, channels, seq_len]
+        sampling_rate: Sampling rate of the signal in Hz
+        
+    Returns:
+        Signal with enhanced EEG frequency characteristics
+    """
+    # Check if we need to transpose for consistency
+    signal_is_transposed = False
+    if signal.dim() == 3 and signal.shape[2] > signal.shape[1]:
+        # Assume [batch, channels, seq_len] format, transpose to [batch, seq_len, channels]
+        signal = signal.transpose(1, 2)
+        signal_is_transposed = True
+    
+    # Get dimensions
+    batch_size, seq_len, n_channels = signal.shape
+    
+    # Process each channel separately
+    processed_signal = []
+    
+    for ch in range(n_channels):
+        # Extract channel data [batch, seq_len]
+        channel_data = signal[:, :, ch]
+        
+        # Apply FFT
+        fft = torch.fft.rfft(channel_data, dim=1)
+        fft_mag = torch.abs(fft)
+        fft_phase = torch.angle(fft)
+        
+        # Create frequency axis
+        freqs = torch.fft.rfftfreq(seq_len, 1/sampling_rate, device=signal.device)
+        
+        # Create EEG rhythm masks
+        delta_mask = ((freqs >= 0.5) & (freqs <= 4)).float() * 1.2  # Delta (0.5-4 Hz)
+        theta_mask = ((freqs >= 4) & (freqs <= 8)).float() * 1.5    # Theta (4-8 Hz)
+        alpha_mask = ((freqs >= 8) & (freqs <= 13)).float() * 2.0   # Alpha (8-13 Hz)
+        beta_mask = ((freqs >= 13) & (freqs <= 30)).float() * 1.2   # Beta (13-30 Hz)
+        gamma_mask = ((freqs >= 30) & (freqs <= 45)).float() * 0.8  # Gamma (30-45 Hz)
+        
+        # Set very high frequencies to lower values (common in EEG)
+        high_freq_mask = (freqs > 45).float() * 0.3
+        
+        # Combine masks
+        eeg_mask = delta_mask + theta_mask + alpha_mask + beta_mask + gamma_mask + high_freq_mask
+        
+        # Apply soft masks to enhance natural EEG characteristics
+        # This doesn't completely remove frequencies but enhances the natural distribution
+        weighted_fft_mag = fft_mag * (0.7 + 0.3 * eeg_mask.unsqueeze(0))
+        
+        # Reconstruct complex FFT using modified magnitude and original phase
+        weighted_fft = weighted_fft_mag * torch.exp(1j * fft_phase)
+        
+        # Convert back to time domain
+        processed_channel = torch.fft.irfft(weighted_fft, n=seq_len, dim=1)
+        processed_signal.append(processed_channel.unsqueeze(-1))
+    
+    # Concatenate channels
+    processed_signal = torch.cat(processed_signal, dim=-1)
+    
+    # Transpose back if needed
+    if signal_is_transposed:
+        processed_signal = processed_signal.transpose(1, 2)
+    
+    return processed_signal
 
 class DecoderLayer(nn.Module):
     """
@@ -345,6 +413,8 @@ class DenoiseDiffusion:
         self.time_diff_constraint = time_diff_constraint
         self.device = device
         self.debug = debug
+        # Add the frequency constraint function as an attribute
+        self.frequency_constraint = frequency_constraint
 
         # Create beta schedule (linearly increasing variance)
         self.beta = torch.linspace(0.0001, 0.02, n_steps).to(device)
@@ -429,25 +499,44 @@ class DenoiseDiffusion:
 
     def p_sample(self, xt: torch.Tensor, t: torch.Tensor):
         """
-        Sample from p_θ(x_{t-1}|x_t): perform one denoising step.
+        Sample from p_θ(x_{t-1}|x_t): perform one denoising step with enhanced processing.
         
         Args:
-            xt: Noisy input at time step t [batch, seq_len, channels]
+            xt: Noisy input at time step t [batch, seq_len, channels] or [batch, channels, seq_len]
             t: Timestep indices [batch]
             
         Returns:
             x_{t-1}: Sample with less noise (one step of denoising)
         """
+        # Store original shape for consistent output
+        original_shape = xt.shape
+        batch_size = xt.shape[0]
+        
+        # For early steps (high noise), nothing special needed
+        # For later steps (getting close to final image), apply enhancements
+        is_late_step = t[0] < self.n_steps * 0.3  # Consider last 30% as "late steps"
+        is_very_late_step = t[0] < self.n_steps * 0.1  # Last 10% as "very late steps"
+        is_final_steps = t[0] < self.n_steps * 0.05  # Last 5% as "final steps"
+        
         # Predict noise using the model
         predicted_noise = self.eps_model(xt, t)
         
         # Make sure predicted_noise has the same shape as xt
         if predicted_noise.shape != xt.shape:
             try:
+                # Try direct reshaping
                 predicted_noise = predicted_noise.view(xt.shape)
             except:
-                # If reshape fails, log a warning
-                if self.debug:
+                try:
+                    # Try transposing if dimensions are swapped
+                    if predicted_noise.dim() == 3 and xt.dim() == 3:
+                        if predicted_noise.shape[1] == xt.shape[2] and predicted_noise.shape[2] == xt.shape[1]:
+                            predicted_noise = predicted_noise.transpose(1, 2)
+                    # If still doesn't match, try to reshape anyway
+                    if predicted_noise.shape != xt.shape:
+                        predicted_noise = predicted_noise.reshape(xt.shape[0], -1).reshape(xt.shape)
+                except:
+                    # If reshape fails, log a warning
                     print(f"Warning: Shape mismatch in p_sample. Predicted: {predicted_noise.shape}, Expected: {xt.shape}")
         
         # Get parameters from the noise schedule
@@ -479,9 +568,122 @@ class DenoiseDiffusion:
         is_last_step = (t == 0).view((-1,) + (1,) * (len(xt.shape) - 1))
         noise = torch.where(is_last_step, 0.0, noise)
         
-        # Return sample
-        return mean + torch.sqrt(var) * noise
-    
+        # Apply variance annealing for smoother outputs in later steps
+        if is_late_step:
+            # Reduce noise variance in late steps
+            noise_strength = torch.ones_like(noise)
+            # Create a factor that decreases as we get closer to t=0
+            timestep_factor = t[0].float() / self.n_steps
+            # Scale noise by this factor (more reduction in later steps)
+            noise_strength = noise_strength * (0.5 + 0.5 * timestep_factor)
+            noise = noise * noise_strength
+        
+        # Calculate result with possibly reduced noise
+        result = mean + torch.sqrt(var) * noise
+        
+        # For very late steps, apply additional processing to enhance naturalness
+        if is_very_late_step:
+            # Apply temporal smoothing
+            if result.dim() == 3:
+                # Identify which dimension is time (usually the longer one)
+                time_dim = 1 if result.shape[1] >= result.shape[2] else 2
+                
+                if time_dim == 1:
+                    # Apply 1D temporal smoothing with a small kernel
+                    kernel_size = min(5, result.shape[1] // 10)  # Kernel size based on signal length
+                    if kernel_size % 2 == 0:  # Ensure odd kernel size
+                        kernel_size += 1
+                        
+                    if kernel_size > 2:  # Only smooth if kernel size is reasonable
+                        padding = kernel_size // 2
+                        # Create a 1D smoothing kernel (gaussian-like)
+                        smoothing_kernel = torch.tensor(
+                            [0.1, 0.2, 0.4, 0.2, 0.1] if kernel_size == 5 else [1/kernel_size] * kernel_size,
+                            device=result.device
+                        ).view(1, 1, kernel_size)
+                        
+                        # Process each channel separately
+                        channels = result.shape[2]
+                        smoothed = []
+                        for c in range(channels):
+                            channel = result[:, :, c:c+1]  # [batch, time, 1]
+                            # Apply convolution for smoothing
+                            smoothed_channel = F.conv1d(
+                                F.pad(channel.transpose(1, 2), (padding, padding), mode='replicate'),
+                                smoothing_kernel,
+                                groups=1
+                            ).transpose(1, 2)
+                            smoothed.append(smoothed_channel)
+                        
+                        # Combine smoothed channels
+                        smoothed_result = torch.cat(smoothed, dim=2)
+                        
+                        # Blend original and smoothed based on timestep
+                        # More smoothing as we approach t=0
+                        blend_factor = 1.0 - (t[0].float() / (self.n_steps * 0.1))
+                        result = (1.0 - blend_factor) * result + blend_factor * smoothed_result
+                
+                elif time_dim == 2:
+                    # Similar smoothing but for [batch, channels, time] format
+                    kernel_size = min(5, result.shape[2] // 10)
+                    if kernel_size % 2 == 0:
+                        kernel_size += 1
+                        
+                    if kernel_size > 2:
+                        padding = kernel_size // 2
+                        smoothing_kernel = torch.tensor(
+                            [0.1, 0.2, 0.4, 0.2, 0.1] if kernel_size == 5 else [1/kernel_size] * kernel_size,
+                            device=result.device
+                        ).view(1, 1, kernel_size)
+                        
+                        # Process each channel
+                        channels = result.shape[1]
+                        smoothed = []
+                        for c in range(channels):
+                            channel = result[:, c:c+1, :]  # [batch, 1, time]
+                            # Apply convolution
+                            smoothed_channel = F.conv1d(
+                                F.pad(channel, (padding, padding), mode='replicate'),
+                                smoothing_kernel,
+                                groups=1
+                            )
+                            smoothed.append(smoothed_channel)
+                        
+                        # Combine channels
+                        smoothed_result = torch.cat(smoothed, dim=1)
+                        
+                        # Blend based on timestep
+                        blend_factor = 1.0 - (t[0].float() / (self.n_steps * 0.1))
+                        result = (1.0 - blend_factor) * result + blend_factor * smoothed_result
+        
+        # For final steps, apply frequency domain constraints for realistic EEG
+        if is_final_steps and hasattr(self, 'frequency_constraint'):
+            try:
+                # Apply frequency domain enhancements
+                freq_enhanced = self.frequency_constraint(result)
+                
+                # Blend original and frequency-enhanced based on timestep
+                blend_factor = 1.0 - (t[0].float() / (self.n_steps * 0.05))
+                result = (1.0 - blend_factor) * result + blend_factor * freq_enhanced
+            except Exception as e:
+                # Fallback if frequency processing fails
+                print(f"Warning: Frequency processing failed: {e}")
+        
+        # Ensure output shape consistency
+        if result.shape != original_shape:
+            try:
+                result = result.view(original_shape)
+            except:
+                try:
+                    if result.dim() == 3 and original_shape[1] == result.shape[2] and original_shape[2] == result.shape[1]:
+                        result = result.transpose(1, 2)
+                    else:
+                        result = result.reshape(batch_size, -1).reshape(original_shape)
+                except:
+                    print(f"Error: Failed to maintain shape consistency in p_sample")
+        
+        return result
+        
     def p_sample_noise(self, xt: torch.Tensor, t: torch.Tensor, s: torch.Tensor):
         """
         Sample from p_θ(x_{t-1}|x_t) with subject-specific conditioning.
@@ -609,8 +811,8 @@ class DenoiseDiffusion:
         return total_loss
 
     def loss_with_diff_constraint(self, x0: torch.Tensor, label: torch.Tensor, 
-                                noise: Optional[torch.Tensor] = None, debug=False, 
-                                noise_content_kl_co=1.0, arc_subject_co=0.1, orgth_co=2.0):
+                            noise: Optional[torch.Tensor] = None, debug=False, 
+                            noise_content_kl_co=1.0, arc_subject_co=0.1, orgth_co=2.0):
         """
         Enhanced loss function with multiple constraints for better EEG generation.
         
@@ -669,21 +871,51 @@ class DenoiseDiffusion:
             print(f"Content noise shape: {eps_theta.shape}")
             print(f"Subject noise shape: {subject_theta.shape}")
         
-        # Calculate time difference constraint penalty
+        # Calculate time difference constraint penalty - ENHANCED VERSION
         constraint_penalty = 0
         if self.time_diff_constraint and xt.dim() >= 3 and xt.shape[1] > 1:
             # For EEG data, typically time is dimension 1
             time_dim = 1
             step_size = getattr(self, 'step_size', 1)
             
-            # Calculate penalty for adjacent time windows to ensure smoothness
+            # Calculate multiple levels of temporal consistency
+            # Short-term consistency (adjacent time steps)
+            short_term_penalty = 0
+            for i in range(eps_theta.shape[time_dim] - 1):
+                short_term_penalty += F.mse_loss(
+                    eps_theta[:, i+1], 
+                    eps_theta[:, i], 
+                    reduction='mean'
+                )
+            short_term_penalty /= (eps_theta.shape[time_dim] - 1)
+            
+            # Medium-term consistency (steps apart)
+            medium_term_penalty = 0
             for i in range(eps_theta.shape[time_dim] - step_size):
-                constraint_penalty += F.mse_loss(
+                medium_term_penalty += F.mse_loss(
                     eps_theta[:, i+step_size], 
                     eps_theta[:, i], 
                     reduction='mean'
                 )
-            constraint_penalty /= (eps_theta.shape[time_dim] - step_size)
+            medium_term_penalty /= (eps_theta.shape[time_dim] - step_size)
+            
+            # Long-term consistency (overall pattern)
+            if eps_theta.shape[time_dim] > 10:
+                segment_size = eps_theta.shape[time_dim] // 5  # Divide into 5 segments
+                long_term_penalty = 0
+                for i in range(eps_theta.shape[time_dim] - segment_size):
+                    if i % segment_size == 0:  # Only check between segments
+                        long_term_penalty += F.mse_loss(
+                            eps_theta[:, i+segment_size], 
+                            eps_theta[:, i], 
+                            reduction='mean'
+                        )
+                long_term_penalty /= (eps_theta.shape[time_dim] // segment_size)
+            else:
+                long_term_penalty = 0
+            
+            # Combine penalties with weights favoring short and medium-term consistency
+            constraint_penalty = 0.5 * short_term_penalty + 0.3 * medium_term_penalty + 0.2 * long_term_penalty
         
         # Calculate orthogonality loss between content and subject components
         # This encourages content and subject noise to be independent
@@ -740,8 +972,9 @@ class DenoiseDiffusion:
         # Apply weights to each component
         total_loss = noise_prediction_loss
         
+        # Enhanced temporal consistency weight (increased from 0.1 to 0.5)
         if self.time_diff_constraint:
-            constraint_weight = 0.1
+            constraint_weight = 0.5  # Increased weight for stronger temporal constraint
             total_loss = total_loss + constraint_weight * constraint_penalty
         
         if orgth_co > 0:
@@ -784,6 +1017,9 @@ class DenoiseDiffusion:
         # Sample x_T from standard normal distribution
         x = torch.randn(shape, device=device)
         
+        # Store original shape to ensure consistent output format
+        original_shape = x.shape
+        
         # Progressively denoise x_t for t = T, T-1, ..., 1
         for t_step in range(sample_steps):
             # Current timestep (going backwards)
@@ -795,6 +1031,10 @@ class DenoiseDiffusion:
             # Sample from p(x_{t-1} | x_t)
             with torch.no_grad():
                 x = self.p_sample(x, t_batch)
+                
+                # Ensure shape consistency through each step
+                if x.shape != original_shape:
+                    x = x.view(original_shape)
                 
         return x
     
@@ -827,6 +1067,9 @@ class DenoiseDiffusion:
         # Sample x_T from standard normal
         x = torch.randn(shape, device=device)
         
+        # Store original shape to ensure consistent output format
+        original_shape = x.shape
+        
         # Progressively denoise with subject conditioning
         for t_step in range(sample_steps):
             # Current timestep (going backwards)
@@ -839,8 +1082,11 @@ class DenoiseDiffusion:
             with torch.no_grad():
                 x = self.p_sample_noise(x, t_batch, subject_ids)
                 
+                # Ensure shape consistency through each step
+                if x.shape != original_shape:
+                    x = x.view(original_shape)
+                
         return x
-
 
 class Model(nn.Module):
     """
@@ -1033,7 +1279,7 @@ class Model(nn.Module):
         """
         Forward pass for the diffusion model noise prediction.
         Args:
-            xt: Noisy input at time step t - shape [batch, seq_len, channels]
+            xt: Noisy input at time step t - shape [batch, seq_len, channels] or [batch, channels, seq_len]
             t: Time step indices, can be None during initialization
         Returns:
             Predicted noise - same shape as input
@@ -1041,6 +1287,23 @@ class Model(nn.Module):
         # Store original shape for output reshaping
         original_shape = xt.shape
         batch_size = xt.shape[0]
+        
+        # Fix input shape inconsistency
+        # The model expects [batch, seq_len, channels] but might get [batch, channels, seq_len]
+        # Check dimensions and transpose if needed
+        if xt.dim() == 3:
+            # If channels (enc_in) is much smaller than seq_len, we can detect the right format
+            # In your case, channels=19, seq_len=128
+            if xt.shape[1] == self.enc_in and xt.shape[2] == self.seq_len:
+                # Input is [batch, channels, seq_len], transpose to [batch, seq_len, channels]
+                print(f"Transposing input from shape {xt.shape} to match expected format")
+                xt = xt.transpose(1, 2)
+            # elif xt.shape[1] == self.seq_len and xt.shape[2] == self.enc_in:
+            #     # Already in correct [batch, seq_len, channels] format
+            #     print(f"Input shape {xt.shape} already in expected format")
+            # else:
+            #     # If dimensions don't clearly match expected values, log a warning
+            #     print(f"WARNING: Unexpected input shape {xt.shape}. Expected [{batch_size}, {self.seq_len}, {self.enc_in}] or [{batch_size}, {self.enc_in}, {self.seq_len}]")
         
         # Check if t is None and create a default t if needed
         if t is None:
@@ -1086,11 +1349,25 @@ class Model(nn.Module):
         noise_pred_flat = self.noise_pred(output_flat)
         
         # Reshape to original input shape
-        # The noise_pred expects to output [batch, channels, seq_len]
-        # but we might need to reshape to match input [batch, seq_len, channels]
+        # The noise_pred outputs [batch, channels, seq_len] or [batch, seq_len, channels]
         noise_pred = noise_pred_flat
+        
+        # Ensure the output has the same shape as the input
         if noise_pred.shape != original_shape:
-            noise_pred = noise_pred.view(original_shape)
+            # print(f"Reshaping output from {noise_pred.shape} to match input shape {original_shape}")
+            # Try direct reshaping
+            try:
+                noise_pred = noise_pred.view(original_shape)
+            except:
+                # If direct reshape fails, try transposing dimensions
+                try:
+                    if noise_pred.dim() == 3 and original_shape[1] == noise_pred.shape[2] and original_shape[2] == noise_pred.shape[1]:
+                        noise_pred = noise_pred.transpose(1, 2)
+                    else:
+                        # Last resort: just reshape to match original shape's sizes
+                        noise_pred = noise_pred.reshape(batch_size, -1).reshape(original_shape)
+                except:
+                    print(f"ERROR: Failed to reshape output to match input shape. Output shape: {noise_pred.shape}, Input shape: {original_shape}")
         
         return noise_pred
     

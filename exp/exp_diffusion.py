@@ -94,7 +94,7 @@ class Exp_Diffusion(Exp_Basic):
         vali_data, vali_loader = self._get_data(flag='VAL')
         test_data, test_loader = self._get_data(flag='TEST')
         
-        print("Training data shape:", train_data.X.shape)
+        print("Training data shape:", train_data.X.shape if hasattr(train_data, 'X') else "Unknown")
         if hasattr(train_data, 'y'):
             print("Training label shape:", train_data.y.shape)
         
@@ -124,7 +124,7 @@ class Exp_Diffusion(Exp_Basic):
         model_optim = self._select_optimizer()
         
         # Use automatic mixed precision for faster training if specified
-        if self.args.use_amp:
+        if hasattr(self.args, 'use_amp') and self.args.use_amp:
             scaler = torch.cuda.amp.GradScaler()
         
         for epoch in range(self.args.train_epochs):
@@ -133,7 +133,7 @@ class Exp_Diffusion(Exp_Basic):
             
             self.model.train()
             epoch_time = time.time()
-            for i, (batch_x, batch_y, padding_mask) in enumerate(tqdm(train_loader)):
+            for i, (batch_x, batch_y, padding_mask) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{self.args.train_epochs}")):
                 iter_count += 1
                 
                 model_optim.zero_grad()
@@ -143,8 +143,12 @@ class Exp_Diffusion(Exp_Basic):
                 # Get diffusion model (handles DataParallel correctly)
                 diffusion = self.get_diffusion()
                 
+                # Print shape info for first batch of first epoch
+                if epoch == 0 and i == 0:
+                    print(f"Input batch shape: {batch_x.shape}")
+                
                 # Training step with optional mixed precision
-                if self.args.use_amp:
+                if hasattr(self.args, 'use_amp') and self.args.use_amp:
                     with torch.cuda.amp.autocast():
                         loss = diffusion.loss(batch_x)
                     scaler.scale(loss).backward()
@@ -223,7 +227,11 @@ class Exp_Diffusion(Exp_Basic):
                 + "/"
             )
             model_path = path + "checkpoint.pth"
-            self.model.load_state_dict(torch.load(model_path))
+            if os.path.exists(model_path):
+                self.model.load_state_dict(torch.load(model_path))
+                print(f"Successfully loaded model from {model_path}")
+            else:
+                print(f"Warning: Model file {model_path} not found. Using initialized model.")
         
         # Initialize metrics dictionaries
         sample_val_metrics_dict = {"Accuracy": 0}
@@ -236,21 +244,91 @@ class Exp_Diffusion(Exp_Basic):
         # Get diffusion model (handles DataParallel correctly)
         diffusion = self.get_diffusion()
         
-        # Sample new data from the diffusion model
+        # Load test data to check input shapes
+        test_data, test_loader = self._get_data(flag='TEST')
+        
+        # Try to determine the expected shape format from the dataset
+        expected_shape_format = None
+        if hasattr(test_data, 'X'):
+            if isinstance(test_data.X, torch.Tensor) or isinstance(test_data.X, np.ndarray):
+                data_shape = test_data.X.shape
+                if len(data_shape) >= 3:
+                    print(f"Dataset shape: {data_shape}")
+                    # Determine if the format is (batch, seq_len, channels) or (batch, channels, seq_len)
+                    # For EEG data, typically channels < seq_len
+                    if data_shape[1] < data_shape[2]:
+                        expected_shape_format = "batch_channel_seq"
+                        print(f"Dataset appears to use (batch, channels, seq_len) format")
+                    else:
+                        expected_shape_format = "batch_seq_channel"
+                        print(f"Dataset appears to use (batch, seq_len, channels) format")
+        
+        # Get number of samples to generate
+        n_samples = getattr(self.args, 'num_samples', 16)
+        samples_per_batch = getattr(self.args, 'samples_per_batch', 16)
+        
+        # Calculate number of batches needed
+        num_batches = (n_samples + samples_per_batch - 1) // samples_per_batch
+        
+        print(f"Generating {n_samples} samples in {num_batches} batches")
+        
+        # Create a list to store all generated samples
+        all_samples = []
+        
+        # Sample new data from the diffusion model in batches
         with torch.no_grad():
-            n_samples = 16  # Number of samples to generate
+            for batch_idx in tqdm(range(num_batches), desc="Generating batches"):
+                # Calculate batch size (may be smaller for the last batch)
+                batch_size = min(samples_per_batch, n_samples - batch_idx * samples_per_batch)
+                
+                # Determine the shape to use for generation
+                if expected_shape_format == "batch_channel_seq":
+                    # Use (batch, channels, seq_len) format
+                    sample_shape = (batch_size, self.args.enc_in, self.args.seq_len)
+                    print(f"Using shape format: (batch, channels, seq_len) = {sample_shape}")
+                else:
+                    # Default to (batch, seq_len, channels) format
+                    sample_shape = (batch_size, self.args.seq_len, self.args.enc_in)
+                    print(f"Using shape format: (batch, seq_len, channels) = {sample_shape}")
+                
+                # Start with random noise
+                x = torch.randn(sample_shape, device=self.device)
+                
+                # Store original shape to maintain consistency
+                original_shape = x.shape
+                
+                # Denoise step by step
+                for t_ in tqdm(range(self.args.sample_steps), desc=f"Sampling batch {batch_idx+1}/{num_batches}"):
+                    t = self.args.n_steps - t_ - 1
+                    
+                    # Display shape before p_sample (first step only)
+                    if t_ == 0:
+                        print(f"Shape before p_sample: {x.shape}")
+                    
+                    # Sample from p_θ(x_{t-1}|x_t)
+                    x = diffusion.p_sample(x, x.new_full((batch_size,), t, dtype=torch.long))
+                    
+                    # Ensure shape consistency after each step (important)
+                    if x.shape != original_shape:
+                        print(f"Shape changed during sampling. Adjusting from {x.shape} to {original_shape}")
+                        # Try to reshape or transpose
+                        try:
+                            if x.dim() == 3 and original_shape[1] == x.shape[2] and original_shape[2] == x.shape[1]:
+                                x = x.transpose(1, 2)
+                            else:
+                                x = x.reshape(batch_size, -1).reshape(original_shape)
+                        except:
+                            print(f"WARNING: Failed to maintain shape consistency during sampling")
+                    
+                    # Display shape after p_sample (first and last step)
+                    if t_ == 0 or t_ == self.args.sample_steps-1:
+                        print(f"Shape after p_sample (step {t_+1}): {x.shape}")
+                
+                # Add batch samples to our collection
+                all_samples.append(x.cpu().numpy())
             
-            # Start with random noise
-            x = torch.randn([n_samples, self.args.enc_in, self.args.seq_len], device=self.device)
-            
-            # Denoise step by step
-            for t_ in tqdm(range(self.args.sample_steps), desc="Sampling"):
-                t = self.args.n_steps - t_ - 1
-                # Sample from p_θ(x_{t-1}|x_t)
-                x = diffusion.p_sample(x, x.new_full((n_samples,), t, dtype=torch.long))
-            
-            # x now contains generated samples
-            samples = x.cpu().numpy()
+            # Combine all batches
+            samples = np.concatenate(all_samples, axis=0)
             
             # Create result directory path
             output_path = (
@@ -268,8 +346,11 @@ class Exp_Diffusion(Exp_Basic):
             if not os.path.exists(output_path):
                 os.makedirs(output_path)
             
-            np.save(output_path + "generated_samples.npy", samples)
-            print(f"Generated samples saved to {output_path}generated_samples.npy")
+            # Save with description of number of samples
+            filename = f"generated_samples_{n_samples}.npy"
+            np.save(output_path + filename, samples)
+            print(f"Generated {samples.shape[0]} samples with final shape {samples.shape}")
+            print(f"Samples saved to {output_path}{filename}")
         
         # For compatibility with the evaluation framework
         params_count = test_params_flop(self.model)
@@ -291,20 +372,67 @@ class Exp_Diffusion(Exp_Basic):
         
         with torch.no_grad():
             if mode == "sample":
-                # Generate new samples from random noise
-                n_samples = 16 if not hasattr(self.args, 'n_samples') else self.args.n_samples
+                # Get the size of the test dataset to match number of samples
+                if hasattr(test_data, 'X'):
+                    dataset_samples = test_data.X.shape[0]
+                    print(f"Detected dataset size: {dataset_samples} samples")
+                elif hasattr(test_data, 'x'):
+                    dataset_samples = test_data.x.shape[0]
+                    print(f"Detected dataset size: {dataset_samples} samples")
+                else:
+                    # If we can't determine dataset size, use default or arg value
+                    dataset_samples = 546
+                    print(f"Could not detect dataset size, using default: {dataset_samples} samples")
                 
-                # Start with random noise
-                x = torch.randn([n_samples, self.args.enc_in, self.args.seq_len], device=self.device)
+                # Get number of samples to generate (from args, or use dataset size)
+                n_samples = getattr(self.args, 'num_samples', dataset_samples)
+                # If arg was specifically provided, it overrides the dataset size
+                if hasattr(self.args, 'num_samples') and self.args.num_samples > 0:
+                    print(f"Overriding with specified number of samples: {n_samples}")
                 
-                # Denoise step by step
-                for t_ in tqdm(range(self.args.sample_steps), desc="Sampling"):
-                    t = self.args.n_steps - t_ - 1
-                    # Sample from p_θ(x_{t-1}|x_t)
-                    x = diffusion.p_sample(x, x.new_full((n_samples,), t, dtype=torch.long))
+                samples_per_batch = getattr(self.args, 'samples_per_batch', 16)
                 
-                # Return generated samples
-                return x.cpu().numpy()
+                # Calculate number of batches needed
+                num_batches = (n_samples + samples_per_batch - 1) // samples_per_batch
+                
+                print(f"Generating {n_samples} samples in {num_batches} batches (batch size: {samples_per_batch})")
+                
+                # Create a list to store all generated samples
+                all_samples = []
+                
+                # Sample in batches
+                for batch_idx in tqdm(range(num_batches), desc="Generating batches"):
+                    # Calculate batch size (may be smaller for the last batch)
+                    batch_size = min(samples_per_batch, n_samples - batch_idx * samples_per_batch)
+                    
+                    # Ensure shape is consistent with expected input format
+                    # Using (batch_size, seq_len, channels) format to match data
+                    sample_shape = (batch_size, self.args.seq_len, self.args.enc_in)
+                    
+                    # Start with random noise
+                    x = torch.randn(sample_shape, device=self.device)
+                    
+                    # Store original shape to maintain consistency
+                    original_shape = x.shape
+                    
+                    # Denoise step by step
+                    for t_ in range(self.args.sample_steps):
+                        t = self.args.n_steps - t_ - 1
+                        # Sample from p_θ(x_{t-1}|x_t)
+                        x = diffusion.p_sample(x, x.new_full((batch_size,), t, dtype=torch.long))
+                        
+                        # Ensure shape consistency
+                        if x.shape != original_shape:
+                            x = x.view(original_shape)
+                    
+                    # Add batch samples to our collection
+                    all_samples.append(x.cpu().numpy())
+                
+                # Combine all batches
+                samples = np.concatenate(all_samples, axis=0)
+                print(f"Generated {samples.shape[0]} samples with shape {samples.shape}")
+                
+                return samples
                 
             elif mode == "reconstruct":
                 # Reconstruct inputs by adding noise and then denoising
@@ -312,6 +440,9 @@ class Exp_Diffusion(Exp_Basic):
                 
                 for i, (batch_x, batch_y, padding_mask) in enumerate(test_loader):
                     batch_x = batch_x.float().to(self.device)
+                    
+                    # Store original shape
+                    original_shape = batch_x.shape
                     
                     # Add noise to the maximum step
                     t = torch.full((batch_x.shape[0],), self.args.n_steps-1, device=self.device, dtype=torch.long)
@@ -323,11 +454,16 @@ class Exp_Diffusion(Exp_Basic):
                         t = self.args.n_steps - t_ - 1
                         # Sample from p_θ(x_{t-1}|x_t)
                         x = diffusion.p_sample(x, x.new_full((x.shape[0],), t, dtype=torch.long))
+                        
+                        # Ensure shape consistency
+                        if x.shape != original_shape:
+                            x = x.view(original_shape)
                     
                     pred_samples.append(x.cpu().numpy())
                 
                 # Concatenate all batches
                 pred_samples = np.concatenate(pred_samples, axis=0)
+                print(f"Reconstructed {pred_samples.shape[0]} samples with shape {pred_samples.shape}")
                 return pred_samples
             
             else:

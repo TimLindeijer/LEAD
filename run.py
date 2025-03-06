@@ -34,9 +34,9 @@ if __name__ == '__main__':
     parser.add_argument('--data_path', type=str, default='ETTh1.csv', help='data file')
     parser.add_argument("--pretraining_datasets", type=str, default="ADSZ,APAVA-19,ADFSU,AD-Auditory,TDBRAIN-19,TUEP,REEG-PD-19",
                         help="List of datasets folder names for pretraining (No overlapping with downstream datasets).")
-    parser.add_argument("--training_datasets", type=str, default="ADFTD,CNBPM,Cognision-rsEEG-19,Cognision-ERP-19,BrainLat-19",
+    parser.add_argument("--training_datasets", type=str, default="ADFTD, BrainLat-19",
                         help="List of datasets folder names for pretraining linear probe, supervised, and finetune training.")
-    parser.add_argument("--testing_datasets", type=str, default="ADFTD,CNBPM,Cognision-rsEEG-19,Cognision-ERP-19,BrainLat-19",
+    parser.add_argument("--testing_datasets", type=str, default="ADFTD, BrainLat-19",
                         help="List of datasets folder names for pretraining linear probe, supervised, and finetune validation and test.")
     parser.add_argument('--checkpoints_path', type=str, default='./checkpoints/LEAD/pretrain_lead/LEAD/P-11-Base/',
                         help='location of pre-trained model checkpoints')
@@ -80,6 +80,12 @@ if __name__ == '__main__':
                         help="whether to use temporal block in encoder", default=False)
     parser.add_argument("--no_channel_block", action="store_true",
                         help="whether to use channel block in encoder", default=False)
+                        
+    # Health status filtering
+    parser.add_argument('--health_filter', type=str, default='all', 
+                        help='Filter by health status: "all", "hc" (healthy controls), "mci", or "dementia"')
+    parser.add_argument('--label_mapping', type=str, default='0,1,2', 
+                        help='Comma-separated mapping of label values for [hc,mci,dementia]')
 
     # MOCO params
     parser.add_argument('--K', type=int, default=65536, help='Size of the queue in MOCO method')
@@ -110,6 +116,8 @@ if __name__ == '__main__':
     parser.add_argument('--arc_hidden_features', type=int, default=None, help='Size of hidden layer in ArcMargin projection (None for no projection)')
     parser.add_argument('--save_samples', action='store_true', help='Save generated samples to disk', default=False)
     parser.add_argument('--samples_path', type=str, default='./generated_samples/', help='Path to save generated samples')
+    parser.add_argument('--num_samples', type=int, default=16, help='Number of samples to generate per subject')
+    parser.add_argument('--samples_per_batch', type=int, default=16, help='Number of samples to generate in each batch to avoid OOM issues')
 
     # optimization
     parser.add_argument('--num_workers', type=int, default=0, help='data loader num workers')
